@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { normalizePlate, staleTicketsForPlate } from '@shared/domain/plate'
 import { productKnownAtFirstWeighing } from '@shared/domain/weighing'
 import type { Operation, OperationType, ProductLine, WeightSample } from '@shared/types'
 import { api, call, errorMessage, formatDateTime, formatKg } from '../api'
@@ -7,6 +8,7 @@ import ManualMark from '../components/ManualMark'
 import ProductLines, { cleanLines, hasIncompleteLine } from '../components/ProductLines'
 import SimulatorPanel from '../components/SimulatorPanel'
 import TicketPreview from '../components/TicketPreview'
+import WeightReadout from '../components/WeightReadout'
 import { useBalance } from '../hooks/useBalance'
 import { useI18n } from '../i18n'
 
@@ -34,6 +36,9 @@ export default function Balance1({ type }: { type: OperationType }) {
   // Camion repassé sur la balance : la 1re pesée du ticket existant est à refaire.
   const [redo, setRedo] = useState(false)
   const [busy, setBusy] = useState(false)
+  // Anciens tickets du même camion, restés sans 2e pesée (voir plus bas).
+  const [stale, setStale] = useState<Operation[]>([])
+  const [confirmCancel, setConfirmCancel] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [preview, setPreview] = useState<{ id: number; html: string } | null>(null)
 
@@ -45,6 +50,10 @@ export default function Balance1({ type }: { type: OperationType }) {
     async (weight: number, manual: boolean, source: WeightSample | null): Promise<void> => {
       if (!ticketRef.current && knowsProduct && hasIncompleteLine(lines)) {
         setError(t('lines.incomplete'))
+        return
+      }
+      if (!ticketRef.current && stale.length > 0) {
+        setError(t('bal1.dup.hint'))
         return
       }
       setBusy(true)
@@ -83,7 +92,7 @@ export default function Balance1({ type }: { type: OperationType }) {
         setBusy(false)
       }
     },
-    [type, plate, driverName, notes, lines, knowsProduct, redo, t]
+    [type, plate, driverName, notes, lines, knowsProduct, redo, stale, t]
   )
 
   const balance = useBalance(setError)
@@ -112,6 +121,41 @@ export default function Balance1({ type }: { type: OperationType }) {
   useEffect(() => {
     reset()
   }, [type])
+
+  // Un camion qui n'est jamais revenu à la 2e balance garde un ticket ouvert. S'il se
+  // représente pour une nouvelle 1re pesée, l'ancien ticket doit être annulé avant.
+  useEffect(() => {
+    if (ticket || normalizePlate(plate) === '') {
+      setStale([])
+      return
+    }
+    let active = true
+    const timer = setTimeout(() => {
+      call(api.ops.list({ status: 'OUVERTE', limit: 200 }))
+        .then((rows) => {
+          if (active) setStale(staleTicketsForPlate(rows, plate))
+        })
+        .catch(() => undefined)
+    }, 350)
+    return () => {
+      active = false
+      clearTimeout(timer)
+    }
+  }, [plate, ticket])
+
+  async function cancelStale(op: Operation): Promise<void> {
+    setBusy(true)
+    setError(null)
+    try {
+      await call(api.ops.cancel(op.id, t('bal1.dup.reason')))
+      setStale((rows) => rows.filter((row) => row.id !== op.id))
+      setConfirmCancel(null)
+    } catch (err) {
+      setError(errorMessage(err))
+    } finally {
+      setBusy(false)
+    }
+  }
 
   async function captureNow(request: CaptureRequest): Promise<void> {
     await captureFirst(request.weight, request.manual, request.manual ? null : balance.sample)
@@ -144,116 +188,149 @@ export default function Balance1({ type }: { type: OperationType }) {
     }
   }
 
+  const captureBox = (
+    <CaptureBox
+      label={redo ? t('bal.redoCapture') : t('bal1.capture')}
+      sample={balance.sample}
+      busy={busy}
+      blocked={!redo && (incomplete || stale.length > 0)}
+      onCapture={(request) => void captureNow(request)}
+      onCancel={redo ? stopRedo : undefined}
+    />
+  )
+
   return (
     <div className="station">
-      <section className="station-left">
-        <div className="readout">
-          <span className="muted">{t('station.weight')}</span>
-          <strong className="weight">{formatKg(balance.sample?.weight ?? null, lang)}</strong>
-          <span className={balance.sample?.stable ? 'badge ok' : 'badge'}>
-            {balance.sample?.stable ? t('station.stable') : t('station.unstable')}
-          </span>
-          {!balance.running && (
-            <button type="button" onClick={() => void balance.startBalance()} disabled={busy}>
-              {t('bal.start')}
-            </button>
-          )}
-        </div>
-        {balance.simulated && <SimulatorPanel />}
+      <WeightReadout
+        sample={balance.sample}
+        running={balance.running}
+        busy={busy}
+        onStart={() => void balance.startBalance()}
+      />
 
-        {error && <p className="error">{error}</p>}
+      {error && <p className="error">{error}</p>}
 
-        {(!ticket || redo) && (
-          <CaptureBox
-            label={redo ? t('bal.redoCapture') : t('bal1.capture')}
-            sample={balance.sample}
-            busy={busy}
-            blocked={!redo && incomplete}
-            onCapture={(request) => void captureNow(request)}
-            onCancel={redo ? stopRedo : undefined}
-          />
-        )}
-      </section>
+      {!ticket && (
+        <div className="card form-card">
+          <h2>{t('bal1.title')}</h2>
+          <div className="form-col">
+            <label>
+              {t('station.plate')}
+              <input autoFocus value={plate} onChange={(e) => setPlate(e.target.value)} />
+            </label>
 
-      <section className="station-right">
-        {!ticket && (
-          <div className="card">
-            <h2>{t('bal1.title')}</h2>
-            <div className="form-col">
-              <label>
-                {t('station.plate')}
-                <input autoFocus value={plate} onChange={(e) => setPlate(e.target.value)} />
-              </label>
-              <label>
-                {t('station.driver')}
-                <input value={driverName} onChange={(e) => setDriverName(e.target.value)} />
-              </label>
-
-              {knowsProduct ? (
-                <ProductLines lines={lines} onChange={setLines} disabled={busy} />
-              ) : (
-                <p className="hint-box">{t('bal1.productLater')}</p>
-              )}
-
-              <label>
-                {t('station.notes')}
-                <textarea rows={2} value={notes} onChange={(e) => setNotes(e.target.value)} />
-              </label>
-            </div>
-          </div>
-        )}
-
-        {ticket && (
-          <div className="card">
-            <div className="ticket-head">
-              <span className="badge">{t('ops.primary')}</span>
-              <strong>{ticket.ticketNo}</strong>
-            </div>
-
-            <div className="summary">
-              <div>
-                <span className="muted">{t('station.plate')}</span>
-                <p>{ticket.plate || '—'}</p>
-              </div>
-              <div>
-                <span className="muted">{t('station.driver')}</span>
-                <p>{ticket.driverName || '—'}</p>
-              </div>
-              <div>
-                <span className="muted">{t('station.firstWeigh')}</span>
-                <p>
-                  <strong>{formatKg(ticket.first?.weight, lang)}</strong>
-                  {ticket.first?.isManual && <ManualMark />}
-                </p>
-                <small className="muted">
-                  {ticket.first ? formatDateTime(ticket.first.at) : '—'}
-                </small>
-              </div>
-            </div>
-
-            {ticket.lines.length > 0 && (
-              <div className="lines-readonly">
-                <span className="muted">{t('lines.title')}</span>
-                {ticket.lines.map((line, index) => (
-                  <div className="row" key={index}>
-                    <span>{line.productCode}</span>
-                    <strong>{formatKg(line.quantityKg, lang)}</strong>
+            {stale.length > 0 && (
+              <div className="stale-box">
+                <strong>{t('bal1.dup.title')}</strong>
+                {stale.map((op) => (
+                  <div className="stale-row" key={op.id}>
+                    <span>
+                      <strong>{op.ticketNo}</strong> · {t(`station.type.${op.type}`)} ·{' '}
+                      {formatKg(op.first?.weight, lang)}
+                      {op.first ? ` · ${formatDateTime(op.first.at)}` : ''}
+                    </span>
+                    {confirmCancel === op.id ? (
+                      <span className="stale-actions">
+                        <strong>{t('bal1.dup.confirm')}</strong>
+                        <button
+                          type="button"
+                          className="danger"
+                          disabled={busy}
+                          onClick={() => void cancelStale(op)}
+                        >
+                          {t('common.confirm')}
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost"
+                          onClick={() => setConfirmCancel(null)}
+                        >
+                          {t('common.cancel')}
+                        </button>
+                      </span>
+                    ) : (
+                      <button type="button" disabled={busy} onClick={() => setConfirmCancel(op.id)}>
+                        {t('bal1.dup.cancel')}
+                      </button>
+                    )}
                   </div>
                 ))}
+                <span className="muted">{t('bal1.dup.hint')}</span>
               </div>
             )}
 
-            {redo ? (
+            <label>
+              {t('station.driver')}
+              <input value={driverName} onChange={(e) => setDriverName(e.target.value)} />
+            </label>
+
+            {knowsProduct ? (
+              <ProductLines lines={lines} onChange={setLines} disabled={busy} />
+            ) : (
+              <p className="hint-box">{t('bal1.productLater')}</p>
+            )}
+
+            <label>
+              {t('station.notes')}
+              <textarea rows={2} value={notes} onChange={(e) => setNotes(e.target.value)} />
+            </label>
+          </div>
+
+          {captureBox}
+        </div>
+      )}
+
+      {ticket && (
+        <div className="card form-card">
+          <div className="ticket-head">
+            <span className="badge">{t('ops.primary')}</span>
+            <strong>{ticket.ticketNo}</strong>
+          </div>
+
+          <div className="summary">
+            <div>
+              <span className="muted">{t('station.plate')}</span>
+              <p>{ticket.plate || '—'}</p>
+            </div>
+            <div>
+              <span className="muted">{t('station.driver')}</span>
+              <p>{ticket.driverName || '—'}</p>
+            </div>
+            <div>
+              <span className="muted">{t('station.firstWeigh')}</span>
+              <p>
+                <strong>{formatKg(ticket.first?.weight, lang)}</strong>
+                {ticket.first?.isManual && <ManualMark />}
+              </p>
+              <small className="muted">
+                {ticket.first ? formatDateTime(ticket.first.at) : '—'}
+              </small>
+            </div>
+          </div>
+
+          {ticket.lines.length > 0 && (
+            <div className="lines-readonly">
+              <span className="muted">{t('lines.title')}</span>
+              {ticket.lines.map((line, index) => (
+                <div className="row" key={index}>
+                  <span>{line.productCode}</span>
+                  <strong>{formatKg(line.quantityKg, lang)}</strong>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {redo ? (
+            <>
               <p className="warn-box">
                 {t('bal.redoHint', { weight: formatKg(ticket.first?.weight, lang) })}
               </p>
-            ) : (
+              {captureBox}
+            </>
+          ) : (
+            <>
               <p className="ok">{t('bal1.done')}</p>
-            )}
-
-            {/* Pendant « refaire », pas d'impression : le bon porterait l'ancien poids. */}
-            {!redo && (
-              <div className="actions-col">
+              <div className="actions-row">
                 <button
                   type="button"
                   className="primary big"
@@ -265,7 +342,7 @@ export default function Balance1({ type }: { type: OperationType }) {
                 <button type="button" disabled={busy} onClick={() => void openPreview(ticket.id)}>
                   {t('station.preview')}
                 </button>
-                {!ticket.second && !redo && (
+                {!ticket.second && (
                   <button type="button" disabled={busy} onClick={startRedo}>
                     {t('bal.redo')}
                   </button>
@@ -274,10 +351,12 @@ export default function Balance1({ type }: { type: OperationType }) {
                   {t('bal1.new')}
                 </button>
               </div>
-            )}
-          </div>
-        )}
-      </section>
+            </>
+          )}
+        </div>
+      )}
+
+      {balance.simulated && <SimulatorPanel />}
 
       {preview && (
         <TicketPreview

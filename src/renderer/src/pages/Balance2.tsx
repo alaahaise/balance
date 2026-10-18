@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Location, OpUpdate } from '@shared/channels'
+import { ticketMatchesQuery } from '@shared/domain/plate'
 import { isManualKind } from '@shared/domain/weighing'
 import type { Operation, OperationType, ProductLine, WeightSample } from '@shared/types'
 import { api, call, errorMessage, formatDateTime, formatKg } from '../api'
@@ -8,6 +9,7 @@ import ManualMark from '../components/ManualMark'
 import ProductLines, { cleanLines, hasIncompleteLine } from '../components/ProductLines'
 import SimulatorPanel from '../components/SimulatorPanel'
 import TicketPreview from '../components/TicketPreview'
+import WeightReadout from '../components/WeightReadout'
 import { useBalance } from '../hooks/useBalance'
 import { useI18n } from '../i18n'
 
@@ -50,6 +52,7 @@ export default function Balance2({ type }: { type: OperationType }) {
   const { t, lang } = useI18n()
   const [pending, setPending] = useState<Operation[]>([])
   const [selected, setSelected] = useState<Operation | null>(null)
+  const [query, setQuery] = useState('')
   const [form, setForm] = useState<CompleteForm>(EMPTY_FORM)
   const [lines, setLines] = useState<ProductLine[]>([])
   const [locations, setLocations] = useState<Location[]>([])
@@ -190,6 +193,7 @@ export default function Balance2({ type }: { type: OperationType }) {
 
   function back(): void {
     stopRedo()
+    setQuery('')
     ticketRef.current = null
     setSelected(null)
     setLines([])
@@ -261,97 +265,94 @@ export default function Balance2({ type }: { type: OperationType }) {
     </>
   )
 
+  const filtered = pending.filter((op) => ticketMatchesQuery(op, query))
+
   return (
     <div className="station">
-      <section className="station-left">
-        <div className="readout">
-          <span className="muted">{t('station.weight')}</span>
-          <strong className="weight">{formatKg(balance.sample?.weight ?? null, lang)}</strong>
-          <span className={balance.sample?.stable ? 'badge ok' : 'badge'}>
-            {balance.sample?.stable ? t('station.stable') : t('station.unstable')}
-          </span>
-          {!balance.running && (
-            <button type="button" onClick={() => void balance.startBalance()} disabled={busy}>
-              {t('bal.start')}
-            </button>
-          )}
-        </div>
-        {balance.simulated && <SimulatorPanel />}
+      {error && <p className="error">{error}</p>}
 
-        {error && <p className="error">{error}</p>}
+      {!selected && (
+        <div className="card form-card">
+          <h2>{t('bal2.pending')}</h2>
+          <input
+            className="search-input"
+            autoFocus
+            type="search"
+            placeholder={t('bal2.search')}
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
 
-        {selected && !complete && (
-          <>
-            <CaptureBox
-              label={redo ? t('bal.redoCapture') : t('bal2.capture')}
-              sample={balance.sample}
-              busy={busy}
-              blocked={!redo && incomplete}
-              onCapture={(request) => void captureNow(request)}
-              onCancel={redo ? stopRedo : undefined}
-            />
-            {!redo && (
-              <button type="button" disabled={busy} onClick={startRedo}>
-                {t('bal.redo')}
-              </button>
-            )}
-          </>
-        )}
-      </section>
-
-      <section className="station-right">
-        {!selected && (
-          <div className="card">
-            <h2>{t('bal2.pending')}</h2>
-
-            <table>
-              <thead>
-                <tr>
-                  <th>{t('station.ticket')}</th>
-                  <th>{t('ops.date')}</th>
-                  <th>{t('station.plate')}</th>
-                  <th>{t('station.firstWeigh')}</th>
-                  <th />
+          <table>
+            <thead>
+              <tr>
+                <th>{t('station.ticket')}</th>
+                <th>{t('ops.date')}</th>
+                <th>{t('station.plate')}</th>
+                <th>{t('station.driver')}</th>
+                <th>{t('station.firstWeigh')}</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((op) => (
+                <tr key={op.id}>
+                  <td>
+                    <strong>{op.ticketNo}</strong>
+                  </td>
+                  <td>{formatDateTime(op.createdAt)}</td>
+                  <td>{op.plate || '—'}</td>
+                  <td>{op.driverName || '—'}</td>
+                  <td>
+                    {formatKg(op.first?.weight, lang)}
+                    {op.first?.isManual && <ManualMark />}
+                  </td>
+                  <td>
+                    <button type="button" className="primary" onClick={() => choose(op)}>
+                      {t('bal2.choose')}
+                    </button>
+                  </td>
                 </tr>
-              </thead>
-              <tbody>
-                {pending.map((op) => (
-                  <tr key={op.id}>
-                    <td>
-                      <strong>{op.ticketNo}</strong>
-                    </td>
-                    <td>{formatDateTime(op.createdAt)}</td>
-                    <td>{op.plate || '—'}</td>
-                    <td>
-                      {formatKg(op.first?.weight, lang)}
-                      {op.first?.isManual && <ManualMark />}
-                    </td>
-                    <td>
-                      <button type="button" className="primary" onClick={() => choose(op)}>
-                        {t('bal2.choose')}
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-                {pending.length === 0 && (
-                  <tr>
-                    <td colSpan={5} className="muted">
-                      {t('bal2.none')}
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        )}
+              ))}
+              {filtered.length === 0 && (
+                <tr>
+                  <td colSpan={6} className="muted">
+                    {pending.length === 0 ? t('bal2.none') : t('bal2.noMatch')}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
 
-        {selected && (
-          <div className="card">
+      {selected && (
+        <>
+          <WeightReadout
+            sample={balance.sample}
+            running={balance.running}
+            busy={busy}
+            onStart={() => void balance.startBalance()}
+          />
+
+          <div className="card form-card">
             <div className="ticket-head">
               <span className={`badge${closed ? ' ok' : ''}`}>
                 {closed ? t('ops.final') : t('ops.primary')}
               </span>
               <strong>{selected.ticketNo}</strong>
+              {!complete && (
+                <div className="head-actions">
+                  {!redo && (
+                    <button type="button" disabled={busy} onClick={startRedo}>
+                      {t('bal.redo')}
+                    </button>
+                  )}
+                  <button type="button" className="ghost" onClick={back}>
+                    {t('bal2.back')}
+                  </button>
+                </div>
+              )}
             </div>
 
             <div className="summary">
@@ -381,38 +382,42 @@ export default function Balance2({ type }: { type: OperationType }) {
             {!complete && (
               <div className="form-col">
                 <ProductLines lines={lines} onChange={setLines} disabled={busy} />
-                <label>
-                  {t('station.partner')}
-                  <input
-                    value={form.partnerName}
-                    onChange={(e) => setForm({ ...form, partnerName: e.target.value })}
-                  />
-                </label>
-                <label>
-                  {t('station.blNo')}
-                  <input
-                    value={form.blNo}
-                    onChange={(e) => setForm({ ...form, blNo: e.target.value })}
-                  />
-                </label>
-                <label>
-                  {t('station.locationFrom')}
-                  <select
-                    value={form.locationFromId}
-                    onChange={(e) => setForm({ ...form, locationFromId: e.target.value })}
-                  >
-                    {locationOptions}
-                  </select>
-                </label>
-                <label>
-                  {t('station.locationTo')}
-                  <select
-                    value={form.locationToId}
-                    onChange={(e) => setForm({ ...form, locationToId: e.target.value })}
-                  >
-                    {locationOptions}
-                  </select>
-                </label>
+                <div className="pair">
+                  <label>
+                    {t('station.partner')}
+                    <input
+                      value={form.partnerName}
+                      onChange={(e) => setForm({ ...form, partnerName: e.target.value })}
+                    />
+                  </label>
+                  <label>
+                    {t('station.blNo')}
+                    <input
+                      value={form.blNo}
+                      onChange={(e) => setForm({ ...form, blNo: e.target.value })}
+                    />
+                  </label>
+                </div>
+                <div className="pair">
+                  <label>
+                    {t('station.locationFrom')}
+                    <select
+                      value={form.locationFromId}
+                      onChange={(e) => setForm({ ...form, locationFromId: e.target.value })}
+                    >
+                      {locationOptions}
+                    </select>
+                  </label>
+                  <label>
+                    {t('station.locationTo')}
+                    <select
+                      value={form.locationToId}
+                      onChange={(e) => setForm({ ...form, locationToId: e.target.value })}
+                    >
+                      {locationOptions}
+                    </select>
+                  </label>
+                </div>
                 <label>
                   {t('station.notes')}
                   <textarea
@@ -530,33 +535,42 @@ export default function Balance2({ type }: { type: OperationType }) {
               </>
             )}
 
-            <div className="row">
-              {complete && (
-                <>
-                  <button
-                    type="button"
-                    className="primary"
-                    disabled={busy}
-                    onClick={() => void printTicket(selected.id)}
-                  >
-                    {t('station.print')}
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => void openPreview(selected.id)}
-                  >
-                    {t('station.preview')}
-                  </button>
-                </>
-              )}
-              <button type="button" className="ghost" onClick={back}>
-                {t('bal2.back')}
-              </button>
-            </div>
+            {!complete && (
+              <>
+                <CaptureBox
+                  label={redo ? t('bal.redoCapture') : t('bal2.capture')}
+                  sample={balance.sample}
+                  busy={busy}
+                  blocked={!redo && incomplete}
+                  onCapture={(request) => void captureNow(request)}
+                  onCancel={redo ? stopRedo : undefined}
+                />
+              </>
+            )}
+
+            {complete && (
+              <div className="actions-row">
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={busy}
+                  onClick={() => void printTicket(selected.id)}
+                >
+                  {t('station.print')}
+                </button>
+                <button type="button" disabled={busy} onClick={() => void openPreview(selected.id)}>
+                  {t('station.preview')}
+                </button>
+                <button type="button" className="ghost" onClick={back}>
+                  {t('bal2.back')}
+                </button>
+              </div>
+            )}
           </div>
-        )}
-      </section>
+
+          {balance.simulated && <SimulatorPanel />}
+        </>
+      )}
 
       {preview && (
         <TicketPreview

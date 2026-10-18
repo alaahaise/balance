@@ -355,24 +355,44 @@ button.chip.active {
 .station {
   flex: 1;
   min-height: 0;
-  display: grid;
-  grid-template-columns: minmax(340px, 42%) 1fr;
-  gap: 16px;
-}
-
-.readout {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 6px;
+  gap: 12px;
+  overflow: auto;
+}
+
+/*
+ * Colonne centrée : sur un grand écran, des champs de 1600 px de large sont
+ * pénibles à lire et à viser. Le contenu garde une largeur confortable, les
+ * marges gauche et droite restent vides et égales.
+ */
+.station > * {
+  width: 100%;
+  max-width: 1000px;
+}
+
+.readout {
+  flex: none;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 16px;
   background: linear-gradient(180deg, var(--panel), #16202f);
   border: 1px solid var(--line);
   border-radius: 12px;
-  padding: 14px 18px;
+  padding: 6px 22px;
+}
+
+.readout-side {
+  display: flex;
+  align-items: center;
+  justify-self: end;
+  gap: 12px;
 }
 
 .weight {
-  font-size: clamp(40px, 4.6vw, 80px);
+  font-size: clamp(36px, 4.2vw, 64px);
   line-height: 1;
   font-weight: 800;
   font-variant-numeric: tabular-nums;
@@ -553,13 +573,31 @@ tr.cancelled {
 
 /* ---------- Simulateur de balance ---------- */
 .sim-panel {
+  flex: none;
+  margin-top: auto;
   display: flex;
   flex-direction: column;
   gap: 8px;
   background: var(--panel);
   border: 1px dashed rgba(245, 158, 11, 0.5);
   border-radius: 12px;
-  padding: 14px;
+  padding: 12px 14px;
+}
+
+/* Boîte compacte, centrée, tout en bas : c'est un outil de test, pas de production. */
+.station > .sim-panel {
+  max-width: 500px;
+}
+
+.sim-panel .warn-box {
+  margin: 0;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+
+.sim-panel .muted {
+  margin: 0;
+  font-size: 13px;
 }
 
 /* ---------- Couleur par type de pesée ---------- */
@@ -716,21 +754,9 @@ tr.cancelled {
   }
 }
 
-/* ---------- Poste de pesée : colonne du poids / colonne du formulaire ---------- */
-.station-left,
-.station-right {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  min-height: 0;
-  min-width: 0;
-}
-
-.station-right {
-  overflow: auto;
-}
-
-.station-right .card {
+/* ---------- Poste de pesée : poids en haut, formulaire pleine largeur dessous ---------- */
+.form-card {
+  flex: 1 0 auto;
   margin-bottom: 0;
 }
 
@@ -738,6 +764,33 @@ tr.cancelled {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+/* Le bouton de capture reste visible en bas de l'écran, même si le formulaire défile. */
+.form-card .capture-box {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  margin-top: 14px;
+  padding: 10px 0 2px;
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+}
+
+.head-actions {
+  display: flex;
+  gap: 8px;
+  margin-inline-start: auto;
+}
+
+.form-col .pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.form-col .pair label {
+  min-width: 0;
 }
 
 button.big {
@@ -754,11 +807,49 @@ button.big {
   font-size: 14px;
 }
 
-.actions-col {
+.actions-row {
   display: flex;
-  flex-direction: column;
+  flex-wrap: wrap;
   gap: 10px;
   margin-top: 12px;
+}
+
+.actions-row button.big {
+  width: auto;
+  flex: 1 1 280px;
+}
+
+.search-input {
+  width: 100%;
+  font-size: 20px;
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  border-radius: 10px;
+}
+
+/* Un camion déjà en attente de 2e pesée se représente à la 1re balance. */
+.stale-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid var(--danger);
+  border-radius: 10px;
+}
+
+.stale-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.stale-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .summary {
@@ -787,7 +878,7 @@ button.big {
 .form-col {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 8px;
 }
 
 .form-col label {
@@ -801,7 +892,7 @@ button.big {
 .form-col select,
 .form-col textarea {
   font-size: 18px;
-  padding: 11px 12px;
+  padding: 9px 12px;
   border-radius: 10px;
 }
 
@@ -843,11 +934,6 @@ button.big {
 }
 
 @media (max-width: 1100px) {
-  .station {
-    grid-template-columns: 1fr;
-    overflow: auto;
-  }
-
   .type-bar {
     flex-wrap: wrap;
   }
