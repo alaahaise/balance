@@ -1,0 +1,1561 @@
+diff --git a/migrations/004_free_weighing_order.sql b/migrations/004_free_weighing_order.sql
+new file mode 100644
+index 0000000..6e4a3ab
+--- /dev/null
++++ b/migrations/004_free_weighing_order.sql
+@@ -0,0 +1,11 @@
++-- 004 — Plus de sens imposé aux pesées (BRUT/TARE).
++--
++-- Le camion peut arriver chargé ou à vide, et revenir peser s'il avait oublié de
++-- le faire avant le chargement. Le sens n'est donc plus connu au moment de la
++-- pesée : le brut est la plus haute des deux pesées, la tare la plus basse, le
++-- net leur différence (calcul fait à la fermeture, voir `computeTicket`).
++--
++-- Les nouvelles lignes de `weighings` n'ont donc pas de `stage`. Les anciennes
++-- gardent le leur : la trace existante n'est pas touchée.
++ALTER TABLE weighings
++  MODIFY stage ENUM('TARE','BRUT') NULL;
+diff --git a/src/main/db/migrate.ts b/src/main/db/migrate.ts
+index b3cddb5..75cb401 100644
+--- a/src/main/db/migrate.ts
++++ b/src/main/db/migrate.ts
+@@ -9,11 +9,13 @@ import type { DbConfig } from '@shared/channels'
+ import init001 from '../../../migrations/001_init.sql?raw'
+ import lines002 from '../../../migrations/002_operation_lines.sql?raw'
+ import manual003 from '../../../migrations/003_manual_and_redo.sql?raw'
++import freeOrder004 from '../../../migrations/004_free_weighing_order.sql?raw'
+ 
+ const MIGRATIONS: ReadonlyArray<{ version: string; sql: string }> = [
+   { version: '001_init', sql: init001 },
+   { version: '002_operation_lines', sql: lines002 },
+-  { version: '003_manual_and_redo', sql: manual003 }
++  { version: '003_manual_and_redo', sql: manual003 },
++  { version: '004_free_weighing_order', sql: freeOrder004 }
+ ]
+ 
+ export async function migrate(cfg: DbConfig): Promise<string[]> {
+diff --git a/src/main/db/operations.integration.test.ts b/src/main/db/operations.integration.test.ts
+index b474751..b0752da 100644
+--- a/src/main/db/operations.integration.test.ts
++++ b/src/main/db/operations.integration.test.ts
+@@ -85,7 +85,7 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
+     )
+ 
+     const afterFirst = await operations.capture(
+-      { operationId: ticket.id, kind: 'BRUT', weight: 12000, isManual: false, stableMs: 700 },
++      { operationId: ticket.id, weight: 12000, isManual: false, stableMs: 700 },
+       user,
+       'poste-test'
+     )
+@@ -94,7 +94,7 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
+     expect(afterFirst.second).toBeNull()
+ 
+     const afterSecond = await operations.capture(
+-      { operationId: ticket.id, kind: 'TARE', weight: 7000.5, isManual: false },
++      { operationId: ticket.id, weight: 7000.5, isManual: false },
+       user,
+       'poste-test'
+     )
+@@ -116,18 +116,10 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
+ 
+   it('refuse la 2e pesée sans produit : aucun écart à calculer', async () => {
+     const ticket = await operations.create({ type: 'ENTREE' }, user)
+-    await operations.capture(
+-      { operationId: ticket.id, kind: 'BRUT', weight: 12000, isManual: false },
+-      user,
+-      'p'
+-    )
++    await operations.capture({ operationId: ticket.id, weight: 12000, isManual: false }, user, 'p')
+ 
+     await expect(
+-      operations.capture(
+-        { operationId: ticket.id, kind: 'TARE', weight: 7000, isManual: false },
+-        user,
+-        'p'
+-      )
++      operations.capture({ operationId: ticket.id, weight: 7000, isManual: false }, user, 'p')
+     ).rejects.toThrow(/au moins un produit/i)
+ 
+     const reloaded = await operations.getById(ticket.id)
+@@ -136,16 +128,11 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
+ 
+   it('somme les produits envoyés avec la 2e pesée', async () => {
+     const ticket = await operations.create({ type: 'SORTIE' }, user)
+-    await operations.capture(
+-      { operationId: ticket.id, kind: 'TARE', weight: 4000, isManual: false },
+-      user,
+-      'p'
+-    )
++    await operations.capture({ operationId: ticket.id, weight: 4000, isManual: false }, user, 'p')
+ 
+     const done = await operations.capture(
+       {
+         operationId: ticket.id,
+-        kind: 'BRUT',
+         weight: 10000,
+         isManual: false,
+         lines: [
+@@ -164,11 +151,7 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
+ 
+   it("refuse d'enregistrer un ticket qui n'a qu'une pesée", async () => {
+     const ticket = await operations.create({ type: 'SORTIE' }, user)
+-    await operations.capture(
+-      { operationId: ticket.id, kind: 'TARE', weight: 5000, isManual: false },
+-      user,
+-      'p'
+-    )
++    await operations.capture({ operationId: ticket.id, weight: 5000, isManual: false }, user, 'p')
+ 
+     await expect(operations.close(ticket.id, user)).rejects.toThrow(/deux pesées/i)
+   })
+@@ -178,16 +161,8 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
+       { type: 'ENTREE', plate: '1-A-1', lines: [{ productCode: 'SABLE', quantityKg: 6000 }] },
+       user
+     )
+-    await operations.capture(
+-      { operationId: ticket.id, kind: 'BRUT', weight: 10000, isManual: false },
+-      user,
+-      'p'
+-    )
+-    await operations.capture(
+-      { operationId: ticket.id, kind: 'TARE', weight: 4000, isManual: false },
+-      user,
+-      'p'
+-    )
++    await operations.capture({ operationId: ticket.id, weight: 10000, isManual: false }, user, 'p')
++    await operations.capture({ operationId: ticket.id, weight: 4000, isManual: false }, user, 'p')
+ 
+     const updated = await operations.update(ticket.id, { plate: '2-b-2', notes: 'corrigé' }, user)
+     expect(updated.plate).toBe('2-B-2')
+@@ -199,11 +174,7 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
+ 
+   it('remplace les produits tant que la 2e pesée n’est pas faite', async () => {
+     const ticket = await operations.create({ type: 'ENTREE' }, user)
+-    await operations.capture(
+-      { operationId: ticket.id, kind: 'BRUT', weight: 10000, isManual: false },
+-      user,
+-      'p'
+-    )
++    await operations.capture({ operationId: ticket.id, weight: 10000, isManual: false }, user, 'p')
+ 
+     const withLines = await operations.setLines(
+       ticket.id,
+@@ -216,57 +187,76 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
+     expect(withLines.lines.map((l) => l.productCode)).toEqual(['ORGE', 'MAÏS'])
+ 
+     // Après la 2e pesée l'écart est calculé contre cette liste : la figer.
+-    await operations.capture(
+-      { operationId: ticket.id, kind: 'TARE', weight: 5000, isManual: false },
+-      user,
+-      'p'
+-    )
++    await operations.capture({ operationId: ticket.id, weight: 5000, isManual: false }, user, 'p')
+     await expect(
+       operations.setLines(ticket.id, [{ productCode: 'AUTRE', quantityKg: 1 }], user)
+     ).rejects.toThrow(/figé/i)
+   })
+ 
+-  it('refuse une 2e pesée du même sens que la 1re', async () => {
+-    const ticket = await operations.create({ type: 'ENTREE' }, user)
++  it('calcule le même net que le camion soit pesé chargé ou à vide en premier', async () => {
++    const lines = [{ productCode: 'CIMENT', quantityKg: 5000 }]
++    const heavyFirst = await operations.create({ type: 'ENTREE', lines }, user)
+     await operations.capture(
+-      { operationId: ticket.id, kind: 'BRUT', weight: 10000, isManual: false },
++      { operationId: heavyFirst.id, weight: 9000, isManual: false },
++      user,
++      'p'
++    )
++    const a = await operations.capture(
++      { operationId: heavyFirst.id, weight: 4000, isManual: false },
+       user,
+       'p'
+     )
+ 
+-    await expect(
+-      operations.capture(
+-        { operationId: ticket.id, kind: 'BRUT', weight: 9000, isManual: false },
+-        user,
+-        'p'
+-      )
+-    ).rejects.toThrow(/inverse|même sens/i)
++    const lightFirst = await operations.create({ type: 'SORTIE' }, user)
++    await operations.capture(
++      { operationId: lightFirst.id, weight: 4000, isManual: false },
++      user,
++      'p'
++    )
++    const b = await operations.capture(
++      { operationId: lightFirst.id, weight: 9000, isManual: false, lines },
++      user,
++      'p'
++    )
++
++    for (const done of [a, b]) {
++      expect(done.grossWeight).toBe(9000)
++      expect(done.tareWeight).toBe(4000)
++      expect(done.netWeight).toBe(5000)
++    }
+   })
+ 
+-  it('refuse une tare supérieure au brut sans rien écrire', async () => {
++  it('le camion qui revient peser après chargement donne toujours haut moins bas', async () => {
++    // Pesé une 1re fois CHARGÉ par oubli de la pesée à vide, puis revenu à vide.
+     const ticket = await operations.create(
+-      { type: 'ENTREE', lines: [{ productCode: 'CIMENT', quantityKg: 1000 }] },
++      { type: 'SORTIE', lines: [{ productCode: 'CIMENT', quantityKg: 5000 }] },
+       user
+     )
+-    await operations.capture(
+-      { operationId: ticket.id, kind: 'BRUT', weight: 5000, isManual: false },
++    await operations.capture({ operationId: ticket.id, weight: 9000, isManual: false }, user, 'p')
++    const done = await operations.capture(
++      {
++        operationId: ticket.id,
++        weight: 4000,
++        isManual: false,
++        lines: [{ productCode: 'CIMENT', quantityKg: 5000 }]
++      },
+       user,
+       'p'
+     )
++    expect(done.netWeight).toBe(5000)
++    expect(done.netWeight).toBeGreaterThanOrEqual(0)
++  })
+ 
++  it('refuse une 3e pesée sur un ticket qui en a déjà deux', async () => {
++    const ticket = await operations.create(
++      { type: 'ENTREE', lines: [{ productCode: 'CIMENT', quantityKg: 1000 }] },
++      user
++    )
++    await operations.capture({ operationId: ticket.id, weight: 5000, isManual: false }, user, 'p')
++    await operations.capture({ operationId: ticket.id, weight: 2000, isManual: false }, user, 'p')
+     await expect(
+-      operations.capture(
+-        { operationId: ticket.id, kind: 'TARE', weight: 6000, isManual: false },
+-        user,
+-        'p'
+-      )
+-    ).rejects.toThrow(/Tare supérieure au brut/i)
+-
+-    // La transaction est annulée : le ticket reste ouvert, sans poids calculés.
+-    const reloaded = await operations.getById(ticket.id)
+-    expect(reloaded?.status).toBe('OUVERTE')
+-    expect(reloaded?.netWeight).toBeNull()
+-    expect(reloaded?.second).toBeNull()
++      operations.capture({ operationId: ticket.id, weight: 3000, isManual: false }, user, 'p')
++    ).rejects.toThrow(/déjà faites/)
+   })
+ 
+   it('annule un ticket avec un motif tracé', async () => {
+@@ -279,11 +269,7 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
+ 
+     // Un ticket annulé ne peut plus être pesé.
+     await expect(
+-      operations.capture(
+-        { operationId: ticket.id, kind: 'TARE', weight: 100, isManual: false },
+-        user,
+-        'p'
+-      )
++      operations.capture({ operationId: ticket.id, weight: 100, isManual: false }, user, 'p')
+     ).rejects.toThrow(/déjà fermé ou annulé/i)
+   })
+ 
+@@ -320,7 +306,7 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
+   it('garde la trace « manuelle » sur le ticket (1re et 2e pesée)', async () => {
+     const ticket = await operations.create({ type: 'SORTIE' }, user)
+     const afterFirst = await operations.capture(
+-      { operationId: ticket.id, kind: 'TARE', weight: 4000, isManual: true, raw: 'MANUEL' },
++      { operationId: ticket.id, weight: 4000, isManual: true, raw: 'MANUEL' },
+       user,
+       'p'
+     )
+@@ -329,7 +315,6 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
+     const done = await operations.capture(
+       {
+         operationId: ticket.id,
+-        kind: 'BRUT',
+         weight: 9000,
+         isManual: false,
+         lines: [{ productCode: 'CIMENT', quantityKg: 5000 }]
+@@ -343,14 +328,10 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
+ 
+   it("refait la 1re pesée : le ticket prend le nouveau poids, l'ancien reste tracé", async () => {
+     const ticket = await operations.create({ type: 'SORTIE' }, user)
+-    await operations.capture(
+-      { operationId: ticket.id, kind: 'TARE', weight: 4000, isManual: false },
+-      user,
+-      'p'
+-    )
++    await operations.capture({ operationId: ticket.id, weight: 4000, isManual: false }, user, 'p')
+ 
+     const redone = await operations.redoFirst(
+-      { operationId: ticket.id, kind: 'TARE', weight: 4150, isManual: true, raw: 'MANUEL' },
++      { operationId: ticket.id, weight: 4150, isManual: true, raw: 'MANUEL' },
+       user,
+       'p'
+     )
+@@ -385,7 +366,6 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
+     const done = await operations.capture(
+       {
+         operationId: ticket.id,
+-        kind: 'BRUT',
+         weight: 9150,
+         isManual: false,
+         lines: [{ productCode: 'CIMENT', quantityKg: 5000 }]
+@@ -397,33 +377,16 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
+     expect(done.netWeight).toBe(5000)
+   })
+ 
+-  it('refuse de refaire la 1re pesée sans pesée, ou une fois la 2e faite, ou dans le mauvais sens', async () => {
++  it('refuse de refaire la 1re pesée sans pesée, ou une fois la 2e faite', async () => {
+     const empty = await operations.create({ type: 'SORTIE' }, user)
+     await expect(
+-      operations.redoFirst(
+-        { operationId: empty.id, kind: 'TARE', weight: 1, isManual: false },
+-        user,
+-        'p'
+-      )
++      operations.redoFirst({ operationId: empty.id, weight: 1, isManual: false }, user, 'p')
+     ).rejects.toThrow(/Aucune 1re pesée/)
+ 
+-    await operations.capture(
+-      { operationId: empty.id, kind: 'TARE', weight: 4000, isManual: false },
+-      user,
+-      'p'
+-    )
+-    await expect(
+-      operations.redoFirst(
+-        { operationId: empty.id, kind: 'BRUT', weight: 5000, isManual: false },
+-        user,
+-        'p'
+-      )
+-    ).rejects.toThrow(/doit rester un TARE/)
+-
++    await operations.capture({ operationId: empty.id, weight: 4000, isManual: false }, user, 'p')
+     await operations.capture(
+       {
+         operationId: empty.id,
+-        kind: 'BRUT',
+         weight: 9000,
+         isManual: false,
+         lines: [{ productCode: 'CIMENT', quantityKg: 5000 }]
+@@ -432,11 +395,7 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
+       'p'
+     )
+     await expect(
+-      operations.redoFirst(
+-        { operationId: empty.id, kind: 'TARE', weight: 4100, isManual: false },
+-        user,
+-        'p'
+-      )
++      operations.redoFirst({ operationId: empty.id, weight: 4100, isManual: false }, user, 'p')
+     ).rejects.toThrow(/2e pesée est déjà faite/)
+   })
+ })
+diff --git a/src/main/db/operations.ts b/src/main/db/operations.ts
+index e6d611d..ae43d21 100644
+--- a/src/main/db/operations.ts
++++ b/src/main/db/operations.ts
+@@ -10,7 +10,7 @@
+  */
+ import type { PoolConnection, ResultSetHeader, RowDataPacket } from 'mysql2/promise'
+ import type { CaptureInput, Location, OpFilter, OpUpdate } from '@shared/channels'
+-import { computeTicket, counterScope, defaultKinds, formatTicketNo } from '@shared/domain/weighing'
++import { computeTicket, counterScope, formatTicketNo } from '@shared/domain/weighing'
+ import type {
+   Operation,
+   OperationType,
+@@ -133,7 +133,11 @@ export async function create(draft: TicketDraft, user: SessionUser): Promise<Ope
+   }
+ }
+ 
+-/** Une ligne de la trace `weighings` : ce qui a réellement été pesé (ou saisi). */
++/**
++ * Une ligne de la trace `weighings` : ce qui a réellement été pesé (ou saisi).
++ * Pas de `stage` : le sens BRUT/TARE n'existe pas à la pesée, il se déduit des
++ * deux poids (le plus haut est le brut).
++ */
+ async function insertWeighing(
+   conn: PoolConnection,
+   input: CaptureInput,
+@@ -142,11 +146,10 @@ async function insertWeighing(
+ ): Promise<void> {
+   await conn.query(
+     `INSERT INTO weighings
+-       (operation_id, stage, weight, captured_at, is_manual, stable_ms, raw_response, station, operator_id)
+-     VALUES (?,?,?,NOW(3),?,?,?,?,?)`,
++       (operation_id, weight, captured_at, is_manual, stable_ms, raw_response, station, operator_id)
++     VALUES (?,?,NOW(3),?,?,?,?,?)`,
+     [
+       input.operationId,
+-      input.kind,
+       input.weight,
+       input.isManual ? 1 : 0,
+       input.stableMs ?? null,
+@@ -177,9 +180,6 @@ export async function capture(
+ 
+     const hasFirst = row.first_weight != null
+     if (hasFirst && row.second_weight != null) throw new Error('Les deux pesées sont déjà faites')
+-    if (hasFirst && row.first_kind === input.kind) {
+-      throw new Error(`La 1re pesée est déjà un ${input.kind} : la 2e doit être l'inverse`)
+-    }
+ 
+     // Enregistrées dans le même geste que la pesée : le total ci-dessous ne peut
+     // pas être calculé sur une liste périmée restée à l'écran.
+@@ -191,19 +191,17 @@ export async function capture(
+     const stage = hasFirst ? 'second' : 'first'
+     await conn.query(
+       `UPDATE operations
+-          SET ${stage}_weight = ?, ${stage}_kind = ?, ${stage}_weigh_at = NOW(), ${stage}_manual = ?
++          SET ${stage}_weight = ?, ${stage}_weigh_at = NOW(), ${stage}_manual = ?
+         WHERE id = ?`,
+-      [input.weight, input.kind, input.isManual ? 1 : 0, input.operationId]
++      [input.weight, input.isManual ? 1 : 0, input.operationId]
+     )
+ 
+     if (hasFirst) {
+       const first: Weighing = {
+-        kind: row.first_kind,
+         weight: Number(row.first_weight),
+         at: String(row.first_weigh_at)
+       }
+       const second: Weighing = {
+-        kind: input.kind,
+         weight: input.weight,
+         at: new Date().toISOString()
+       }
+@@ -227,13 +225,7 @@ export async function capture(
+         toleranceKg: await getSettingNumber(conn, TOLERANCE_KEY, 20)
+       })
+ 
+-      if (!computed.ok) {
+-        throw new Error(
+-          computed.reason === 'NET_NEGATIF'
+-            ? 'Tare supérieure au brut : vérifier le sens des pesées'
+-            : `Calcul du ticket impossible (${computed.reason})`
+-        )
+-      }
++      if (!computed.ok) throw new Error(`Calcul du ticket impossible (${computed.reason})`)
+ 
+       // Le ticket reste OUVERTE : l'opérateur doit confirmer l'enregistrement.
+       // `v_stock_moves` ne compte que les tickets FERMEE, donc rien n'entre en
+@@ -400,21 +392,18 @@ export async function redoFirst(
+     if (row.second_weight != null) {
+       throw new Error('La 2e pesée est déjà faite : annulez le ticket pour recommencer')
+     }
+-    if (row.first_kind !== input.kind) {
+-      throw new Error(`La 1re pesée doit rester un ${row.first_kind}`)
+-    }
+ 
+     const previous = {
+-      kind: row.first_kind,
+       weight: Number(row.first_weight),
+       at: String(row.first_weigh_at),
+       isManual: Boolean(Number(row.first_manual ?? 0))
+     }
+ 
+     await conn.query(
++      // Sans 2e pesée, la seule ligne encore active du ticket est la 1re.
+       `UPDATE weighings SET superseded_at = NOW(3)
+-        WHERE operation_id = ? AND stage = ? AND superseded_at IS NULL`,
+-      [input.operationId, row.first_kind]
++        WHERE operation_id = ? AND superseded_at IS NULL`,
++      [input.operationId]
+     )
+     await insertWeighing(conn, input, station, user.id)
+     await conn.query(
+@@ -430,7 +419,7 @@ export async function redoFirst(
+         'operations',
+         String(input.operationId),
+         JSON.stringify(previous),
+-        JSON.stringify({ kind: input.kind, weight: input.weight, isManual: input.isManual })
++        JSON.stringify({ weight: input.weight, isManual: input.isManual })
+       ]
+     )
+ 
+@@ -588,16 +577,10 @@ export async function listLocations(): Promise<Location[]> {
+ function toOperation(row: RowDataPacket): Operation {
+   const type = row.type as OperationType
+   const num = (value: unknown): number | null => (value == null ? null : Number(value))
+-  const weighing = (
+-    weight: unknown,
+-    kind: unknown,
+-    at: unknown,
+-    manual: unknown
+-  ): Weighing | null =>
++  const weighing = (weight: unknown, at: unknown, manual: unknown): Weighing | null =>
+     weight == null
+       ? null
+       : {
+-          kind: kind as Weighing['kind'],
+           weight: Number(weight),
+           at: String(at),
+           isManual: Boolean(Number(manual ?? 0))
+@@ -608,7 +591,6 @@ function toOperation(row: RowDataPacket): Operation {
+     ticketNo: String(row.ticket_no),
+     type,
+     status: row.status,
+-    allKinds: defaultKinds(type),
+     plate: row.plate ?? null,
+     driverName: row.driver_name ?? null,
+     partnerId: num(row.partner_id),
+@@ -620,8 +602,8 @@ function toOperation(row: RowDataPacket): Operation {
+     weightSupposed: num(row.weight_supposed),
+     notes: row.notes ?? null,
+     lines: [],
+-    first: weighing(row.first_weight, row.first_kind, row.first_weigh_at, row.first_manual),
+-    second: weighing(row.second_weight, row.second_kind, row.second_weigh_at, row.second_manual),
++    first: weighing(row.first_weight, row.first_weigh_at, row.first_manual),
++    second: weighing(row.second_weight, row.second_weigh_at, row.second_manual),
+     tareWeight: num(row.tare_weight),
+     grossWeight: num(row.gross_weight),
+     netWeight: num(row.net_weight),
+diff --git a/src/main/ticket-html.test.ts b/src/main/ticket-html.test.ts
+index e1354bb..2bfc731 100644
+--- a/src/main/ticket-html.test.ts
++++ b/src/main/ticket-html.test.ts
+@@ -8,7 +8,6 @@ function ticket(over: Partial<Operation> = {}): Operation {
+     ticketNo: 'E-2026-000001',
+     type: 'ENTREE',
+     status: 'FERMEE',
+-    allKinds: ['BRUT', 'TARE'],
+     plate: '12345-A-100',
+     driverName: null,
+     partnerId: null,
+@@ -20,8 +19,8 @@ function ticket(over: Partial<Operation> = {}): Operation {
+     weightSupposed: 5000,
+     lines: [{ productId: null, productCode: 'CIMENT', quantityKg: 5000 }],
+     notes: null,
+-    first: { kind: 'BRUT', weight: 12000, at: '2026-10-16 09:05:00' },
+-    second: { kind: 'TARE', weight: 7000, at: '2026-10-16 09:30:00' },
++    first: { weight: 12000, at: '2026-10-16 09:05:00' },
++    second: { weight: 7000, at: '2026-10-16 09:30:00' },
+     tareWeight: 7000,
+     grossWeight: 12000,
+     netWeight: 5000,
+@@ -123,7 +122,7 @@ describe('helpers', () => {
+ 
+   it('marque « M » les poids saisis à la main, avec une légende', () => {
+     const manualFirst = ticket({
+-      first: { kind: 'BRUT', weight: 12000, at: '2026-10-16 09:05:00', isManual: true }
++      first: { weight: 12000, at: '2026-10-16 09:05:00', isManual: true }
+     })
+     const html = buildTicketHtml(manualFirst, opts)
+     // une fois sur la pesée n° 1, une fois sur la ligne Brut du total
+@@ -134,8 +133,8 @@ describe('helpers', () => {
+   it('ne marque pas la tare quand seule la pesée de brut est manuelle', () => {
+     const html = buildTicketHtml(
+       ticket({
+-        first: { kind: 'BRUT', weight: 12000, at: '2026-10-16 09:05:00', isManual: true },
+-        second: { kind: 'TARE', weight: 7000, at: '2026-10-16 09:30:00', isManual: false }
++        first: { weight: 12000, at: '2026-10-16 09:05:00', isManual: true },
++        second: { weight: 7000, at: '2026-10-16 09:30:00', isManual: false }
+       }),
+       opts
+     )
+diff --git a/src/main/ticket-html.ts b/src/main/ticket-html.ts
+index 3a8a850..16a3760 100644
+--- a/src/main/ticket-html.ts
++++ b/src/main/ticket-html.ts
+@@ -10,7 +10,7 @@
+  */
+ import type { Lang, Location } from '@shared/channels'
+ import { isManualKind } from '@shared/domain/weighing'
+-import type { Operation, OperationType, WeighKind } from '@shared/types'
++import type { Operation, OperationType } from '@shared/types'
+ 
+ export function escapeHtml(value: unknown): string {
+   return String(value ?? '').replace(/[&<>"']/g, (char) => {
+@@ -56,7 +56,8 @@ interface Labels {
+   waitingSecond: string
+   manualLegend: string
+   types: Record<OperationType, string>
+-  kinds: Record<WeighKind, string>
++  firstWeigh: string
++  secondWeigh: string
+ }
+ 
+ const LABELS: Record<Lang, Labels> = {
+@@ -92,7 +93,8 @@ const LABELS: Record<Lang, Labels> = {
+       TRANSFERT: 'TICKET DE TRANSFERT',
+       TIERS: 'PESÉE TIERS'
+     },
+-    kinds: { BRUT: 'BRUT (chargé)', TARE: 'TARE (à vide)' }
++    firstWeigh: '1re pesée',
++    secondWeigh: '2e pesée'
+   },
+   ar: {
+     title: 'إدارة الوزن',
+@@ -126,7 +128,8 @@ const LABELS: Record<Lang, Labels> = {
+       TRANSFERT: 'تذكرة تحويل',
+       TIERS: 'وزن الغير'
+     },
+-    kinds: { BRUT: 'الإجمالي (محمّل)', TARE: 'الفارغ (بدون حمولة)' }
++    firstWeigh: 'الوزن الأول',
++    secondWeigh: 'الوزن الثاني'
+   }
+ }
+ 
+@@ -168,7 +171,7 @@ export function buildTicketHtml(
+   const weighing = (w: Operation['first'], index: number): string => {
+     if (!w) return ''
+     return `<div class="weigh">
+-      <div class="row"><span>${escapeHtml(index === 1 ? '1' : '2')} — ${escapeHtml(t.kinds[w.kind])}</span><span>${escapeHtml(formatDateTime(w.at))}</span></div>
++      <div class="row"><span>${escapeHtml(index === 1 ? t.firstWeigh : t.secondWeigh)}</span><span>${escapeHtml(formatDateTime(w.at))}</span></div>
+       <div class="weight">${escapeHtml(kg(w.weight))} kg${w.isManual ? MANUAL_MARK : ''}</div>
+     </div>`
+   }
+diff --git a/src/renderer/src/components/CaptureBox.tsx b/src/renderer/src/components/CaptureBox.tsx
+index 1f2fb7d..514485d 100644
+--- a/src/renderer/src/components/CaptureBox.tsx
++++ b/src/renderer/src/components/CaptureBox.tsx
+@@ -4,28 +4,21 @@ import { useI18n } from '../i18n'
+ 
+ export interface CaptureRequest {
+   weight: number
+-  /** Poids tapé au clavier, ou lu sur une balance instable : marqué « M » sur le ticket. */
++  /** Poids tapé au clavier : marqué « M » sur le ticket, sans lecture de balance à tracer. */
+   manual: boolean
+-  /** Poids tapé au clavier : il n'y a alors pas de lecture de la balance à tracer. */
+-  typed: boolean
+ }
+ 
+ /**
+  * Le gros bouton de capture et ses options, communs aux deux balances.
+  *
+- * Deux façons de peser : lire la balance (poids stable, ou « forcer » un poids
+- * instable), ou taper le poids quand la balance ne répond pas. Dans les deux
+- * cas où le poids ne vient pas d'une lecture stable, la pesée est marquée « M ».
++ * Deux façons de peser : lire la balance (poids stable uniquement), ou taper le
++ * poids quand la balance ne répond pas. Un poids tapé est marqué « M » sur le ticket.
+  */
+ export default function CaptureBox({
+   label,
+   sample,
+   busy,
+   blocked = false,
+-  auto,
+-  onAuto,
+-  force,
+-  onForce,
+   onCapture,
+   onCancel
+ }: {
+@@ -34,10 +27,6 @@ export default function CaptureBox({
+   busy: boolean
+   /** Saisie incomplète ailleurs dans la page : on ne laisse pas capturer. */
+   blocked?: boolean
+-  auto: boolean
+-  onAuto: (value: boolean) => void
+-  force: boolean
+-  onForce: (value: boolean) => void
+   onCapture: (request: CaptureRequest) => void
+   onCancel?: () => void
+ }) {
+@@ -47,18 +36,11 @@ export default function CaptureBox({
+ 
+   const typedKg = Number(typed.replace(',', '.'))
+   const typedOk = typed.trim() !== '' && Number.isFinite(typedKg) && typedKg >= 0
+-  const canCapture =
+-    !busy && !blocked && (manual ? typedOk : sample != null && (sample.stable || force))
+-
+-  function toggleManual(value: boolean): void {
+-    setManual(value)
+-    // La capture automatique lit la balance : elle n'a pas de sens en saisie manuelle.
+-    if (value) onAuto(false)
+-  }
++  const canCapture = !busy && !blocked && (manual ? typedOk : sample?.stable === true)
+ 
+   function capture(): void {
+-    if (manual) onCapture({ weight: typedKg, manual: true, typed: true })
+-    else if (sample) onCapture({ weight: sample.weight, manual: !sample.stable, typed: false })
++    if (manual) onCapture({ weight: typedKg, manual: true })
++    else if (sample) onCapture({ weight: sample.weight, manual: false })
+   }
+ 
+   return (
+@@ -87,29 +69,7 @@ export default function CaptureBox({
+ 
+       <div className="checks">
+         <label className="inline">
+-          <input
+-            type="checkbox"
+-            checked={auto}
+-            disabled={manual}
+-            onChange={(e) => onAuto(e.target.checked)}
+-          />
+-          {t('station.autoCapture')}
+-        </label>
+-        <label className="inline">
+-          <input
+-            type="checkbox"
+-            checked={force}
+-            disabled={manual}
+-            onChange={(e) => onForce(e.target.checked)}
+-          />
+-          {t('station.force')}
+-        </label>
+-        <label className="inline">
+-          <input
+-            type="checkbox"
+-            checked={manual}
+-            onChange={(e) => toggleManual(e.target.checked)}
+-          />
++          <input type="checkbox" checked={manual} onChange={(e) => setManual(e.target.checked)} />
+           {t('cap.manual')}
+         </label>
+       </div>
+diff --git a/src/renderer/src/hooks/useBalance.ts b/src/renderer/src/hooks/useBalance.ts
+index 8ec8da7..49699f8 100644
+--- a/src/renderer/src/hooks/useBalance.ts
++++ b/src/renderer/src/hooks/useBalance.ts
+@@ -1,39 +1,25 @@
+ import { useCallback, useEffect, useRef, useState } from 'react'
+-import type { WeighKind, WeightSample } from '@shared/types'
++import type { WeightSample } from '@shared/types'
+ import { api, call, errorMessage } from '../api'
+ 
+-interface AutoCapture {
+-  /** Case « capture automatique » cochée. */
+-  enabled: () => boolean
+-  /** Pesée attendue, ou null quand il n'y a plus rien à peser. */
+-  nextKind: () => WeighKind | null
+-  capture: (kind: WeighKind, sample: WeightSample) => Promise<void>
+-  /** L'écran possède l'état d'erreur : le crochet ne fait que le remplir. */
+-  onError: (message: string) => void
+-}
+-
+ /**
+- * Balance en direct + capture automatique.
++ * Balance en direct : le poids affiché, et si la liaison est active.
+  *
+- * La capture auto est volontairement prudente : elle exige que le poids ait
+- * bougé depuis la pesée précédente, sinon un camion resté sur le pont
+- * déclencherait une capture avec la même valeur (net nul).
++ * La pesée est toujours déclenchée par l'opérateur (bouton de capture) : une
++ * capture automatique pouvait enregistrer un poids sans qu'il l'ait voulu.
+  *
+- * Partagée par la 1re et la 2e balance pour que ce garde-fou ne diverge pas.
++ * Partagé par la 1re et la 2e balance.
+  */
+-export function useBalance(auto: AutoCapture) {
++export function useBalance(onError: (message: string) => void) {
+   const [sample, setSample] = useState<WeightSample | null>(null)
+   const [running, setRunning] = useState(false)
+   const [simulated, setSimulated] = useState(false)
+ 
+-  const autoRef = useRef(auto)
+-  const epsilonRef = useRef(0.5)
+-  const lastWeightRef = useRef<number | null>(null)
+-  const capturingRef = useRef(false)
+-
++  // L'écran possède l'état d'erreur : le crochet ne fait que le remplir.
++  const onErrorRef = useRef(onError)
+   useEffect(() => {
+-    autoRef.current = auto
+-  }, [auto])
++    onErrorRef.current = onError
++  }, [onError])
+ 
+   useEffect(() => {
+     let active = true
+@@ -42,7 +28,6 @@ export function useBalance(auto: AutoCapture) {
+       .get()
+       .then((settings) => {
+         if (!settings.balance) return
+-        epsilonRef.current = settings.balance.stableEpsilon
+         // Connexion automatique seulement si un port est configuré : sinon la
+         // page afficherait une erreur rouge dès son ouverture.
+         return api.balance.start().then((status) => {
+@@ -52,53 +37,26 @@ export function useBalance(auto: AutoCapture) {
+         })
+       })
+       .catch((err) => {
+-        if (active) autoRef.current.onError(errorMessage(err))
++        if (active) onErrorRef.current(errorMessage(err))
+       })
+ 
+     const offSample = api.balance.onSample(setSample)
+-    const offStable = api.balance.onStable((stable) => {
+-      const current = autoRef.current
+-      if (capturingRef.current || !current.enabled()) return
+-      const kind = current.nextKind()
+-      if (!kind) return
+-
+-      const previous = lastWeightRef.current
+-      if (previous != null && Math.abs(stable.weight - previous) < epsilonRef.current) return
+-
+-      capturingRef.current = true
+-      // L'écran signale déjà l'erreur : ici seule la libération du verrou compte.
+-      void current
+-        .capture(kind, stable)
+-        .then(() => {
+-          lastWeightRef.current = stable.weight
+-        })
+-        .catch(() => undefined)
+-        .finally(() => {
+-          capturingRef.current = false
+-        })
+-    })
+ 
+     return () => {
+       active = false
+       offSample()
+-      offStable()
+     }
+   }, [])
+ 
+-  /** Repart d'une base de comparaison vierge (nouveau ticket). */
+-  const resetTrace = useCallback((seed: number | null = null) => {
+-    lastWeightRef.current = seed
+-  }, [])
+-
+   const startBalance = useCallback(async () => {
+     try {
+       const status = await call(api.balance.start())
+       setRunning(status.running)
+       setSimulated(status.simulated)
+     } catch (err) {
+-      autoRef.current.onError(errorMessage(err))
++      onErrorRef.current(errorMessage(err))
+     }
+   }, [])
+ 
+-  return { sample, running, simulated, resetTrace, startBalance }
++  return { sample, running, simulated, startBalance }
+ }
+diff --git a/src/renderer/src/i18n.tsx b/src/renderer/src/i18n.tsx
+index 70ff53f..6f9e152 100644
+--- a/src/renderer/src/i18n.tsx
++++ b/src/renderer/src/i18n.tsx
+@@ -127,7 +127,7 @@ const fr = {
+   'station.hint.SORTIE': 'Marchandise qui SORT de la société',
+   'station.hint.TRANSFERT': 'Marchandise déplacée entre deux lieux',
+   'station.hint.TIERS': 'Pesée pour une personne extérieure',
+-  'bal1.productLater': 'Camion à vide : le produit et la quantité se saisissent à la 2e balance.',
++  'bal1.productLater': 'Le produit et la quantité se saisissent à la 2e balance.',
+   'lines.incomplete': 'Chaque produit doit avoir un nom et une quantité.',
+   'cap.manual': 'Saisir le poids à la main (balance en panne)',
+   'cap.manualWeight': 'Poids tapé (kg)',
+@@ -164,7 +164,8 @@ const fr = {
+   'lines.remove': 'Retirer',
+   'lines.add': 'Ajouter un produit',
+   'lines.total': 'Total supposé',
+-  'lines.hint': 'Une ligne par produit : « 1 t de CMV X » + « 4 t de CMV Y ». Le total devient le poids supposé.',
++  'lines.hint':
++    'Une ligne par produit : « 1 t de CMV X » + « 4 t de CMV Y ». Le total devient le poids supposé.',
+   'lines.empty': 'Aucun produit',
+ 
+   'ops.title': 'Tickets de pesée',
+@@ -311,7 +312,7 @@ const ar: Record<TKey, string> = {
+   'station.hint.SORTIE': 'بضاعة تخرج من الشركة',
+   'station.hint.TRANSFERT': 'بضاعة تنتقل بين مكانين',
+   'station.hint.TIERS': 'وزن لشخص خارجي',
+-  'bal1.productLater': 'الشاحنة فارغة: يتم إدخال المنتج والكمية عند الميزان الثاني.',
++  'bal1.productLater': 'يتم إدخال المنتج والكمية عند الميزان الثاني.',
+   'lines.incomplete': 'يجب أن يحتوي كل منتج على اسم وكمية.',
+   'cap.manual': 'إدخال الوزن يدوياً (الميزان معطل)',
+   'cap.manualWeight': 'الوزن المدخل (كغ)',
+diff --git a/src/renderer/src/pages/Balance1.tsx b/src/renderer/src/pages/Balance1.tsx
+index bbc39cc..de54355 100644
+--- a/src/renderer/src/pages/Balance1.tsx
++++ b/src/renderer/src/pages/Balance1.tsx
+@@ -1,6 +1,6 @@
+ import { useCallback, useEffect, useRef, useState } from 'react'
+-import { defaultKinds, productKnownAtFirstWeighing } from '@shared/domain/weighing'
+-import type { Operation, OperationType, ProductLine, WeighKind, WeightSample } from '@shared/types'
++import { productKnownAtFirstWeighing } from '@shared/domain/weighing'
++import type { Operation, OperationType, ProductLine, WeightSample } from '@shared/types'
+ import { api, call, errorMessage, formatDateTime, formatKg } from '../api'
+ import CaptureBox, { type CaptureRequest } from '../components/CaptureBox'
+ import ManualMark from '../components/ManualMark'
+@@ -31,8 +31,6 @@ export default function Balance1({ type }: { type: OperationType }) {
+   const [notes, setNotes] = useState('')
+   const [lines, setLines] = useState<ProductLine[]>(() => blankLines(type))
+   const [ticket, setTicket] = useState<Operation | null>(null)
+-  const [auto, setAuto] = useState(false)
+-  const [force, setForce] = useState(false)
+   // Camion repassé sur la balance : la 1re pesée du ticket existant est à refaire.
+   const [redo, setRedo] = useState(false)
+   const [busy, setBusy] = useState(false)
+@@ -40,18 +38,11 @@ export default function Balance1({ type }: { type: OperationType }) {
+   const [preview, setPreview] = useState<{ id: number; html: string } | null>(null)
+ 
+   const ticketRef = useRef<Operation | null>(null)
+-  const redoRef = useRef(false)
+-  const firstKind = defaultKinds(type)[0]
+   const knowsProduct = productKnownAtFirstWeighing(type)
+   const incomplete = knowsProduct && hasIncompleteLine(lines)
+ 
+   const captureFirst = useCallback(
+-    async (
+-      kind: WeighKind,
+-      weight: number,
+-      manual: boolean,
+-      source: WeightSample | null
+-    ): Promise<void> => {
++    async (weight: number, manual: boolean, source: WeightSample | null): Promise<void> => {
+       if (!ticketRef.current && knowsProduct && hasIncompleteLine(lines)) {
+         setError(t('lines.incomplete'))
+         return
+@@ -60,7 +51,7 @@ export default function Balance1({ type }: { type: OperationType }) {
+       setError(null)
+       try {
+         let current = ticketRef.current
+-        const isRedo = current != null && redoRef.current
++        const isRedo = current != null && redo
+         if (!current) {
+           const clean = knowsProduct ? cleanLines(lines) : []
+           current = await call(
+@@ -76,7 +67,6 @@ export default function Balance1({ type }: { type: OperationType }) {
+         }
+         const payload = {
+           operationId: current.id,
+-          kind,
+           weight,
+           isManual: manual,
+           stableMs: source?.stableMs ?? null,
+@@ -93,26 +83,18 @@ export default function Balance1({ type }: { type: OperationType }) {
+         setBusy(false)
+       }
+     },
+-    [type, plate, driverName, notes, lines, knowsProduct, t]
++    [type, plate, driverName, notes, lines, knowsProduct, redo, t]
+   )
+ 
+-  const balance = useBalance({
+-    enabled: () => auto,
+-    nextKind: () => (ticketRef.current && !redoRef.current ? null : firstKind),
+-    capture: (kind, sample) => captureFirst(kind, sample.weight, !sample.stable, sample),
+-    onError: setError
+-  })
++  const balance = useBalance(setError)
+ 
+   function stopRedo(): void {
+-    redoRef.current = false
+     setRedo(false)
+   }
+ 
+   function startRedo(): void {
+-    redoRef.current = true
+     setRedo(true)
+     setError(null)
+-    balance.resetTrace()
+   }
+ 
+   function reset(): void {
+@@ -132,17 +114,11 @@ export default function Balance1({ type }: { type: OperationType }) {
+   }, [type])
+ 
+   async function captureNow(request: CaptureRequest): Promise<void> {
+-    await captureFirst(
+-      firstKind,
+-      request.weight,
+-      request.manual,
+-      request.typed ? null : balance.sample
+-    )
++    await captureFirst(request.weight, request.manual, request.manual ? null : balance.sample)
+   }
+ 
+   function newTruck(): void {
+     reset()
+-    balance.resetTrace()
+   }
+ 
+   async function printTicket(id: number): Promise<void> {
+@@ -168,9 +144,6 @@ export default function Balance1({ type }: { type: OperationType }) {
+     }
+   }
+ 
+-  const kindLabel = (kind: WeighKind): string =>
+-    t(kind === 'TARE' ? 'station.kind.TARE' : 'station.kind.BRUT')
+-
+   return (
+     <div className="station">
+       <section className="station-left">
+@@ -185,7 +158,6 @@ export default function Balance1({ type }: { type: OperationType }) {
+               {t('bal.start')}
+             </button>
+           )}
+-          <p className="muted">{t('station.nextWeigh', { kind: kindLabel(firstKind) })}</p>
+         </div>
+         {balance.simulated && <SimulatorPanel />}
+ 
+@@ -193,14 +165,10 @@ export default function Balance1({ type }: { type: OperationType }) {
+ 
+         {(!ticket || redo) && (
+           <CaptureBox
+-            label={redo ? t('bal.redoCapture') : `${t('bal1.capture')} — ${kindLabel(firstKind)}`}
++            label={redo ? t('bal.redoCapture') : t('bal1.capture')}
+             sample={balance.sample}
+             busy={busy}
+             blocked={!redo && incomplete}
+-            auto={auto}
+-            onAuto={setAuto}
+-            force={force}
+-            onForce={setForce}
+             onCapture={(request) => void captureNow(request)}
+             onCancel={redo ? stopRedo : undefined}
+           />
+@@ -258,9 +226,7 @@ export default function Balance1({ type }: { type: OperationType }) {
+                   {ticket.first?.isManual && <ManualMark />}
+                 </p>
+                 <small className="muted">
+-                  {ticket.first
+-                    ? `${kindLabel(ticket.first.kind)} · ${formatDateTime(ticket.first.at)}`
+-                    : '—'}
++                  {ticket.first ? formatDateTime(ticket.first.at) : '—'}
+                 </small>
+               </div>
+             </div>
+diff --git a/src/renderer/src/pages/Balance2.tsx b/src/renderer/src/pages/Balance2.tsx
+index b710c4f..8b49319 100644
+--- a/src/renderer/src/pages/Balance2.tsx
++++ b/src/renderer/src/pages/Balance2.tsx
+@@ -1,7 +1,7 @@
+ import { useCallback, useEffect, useRef, useState } from 'react'
+ import type { Location, OpUpdate } from '@shared/channels'
+-import { defaultKinds, isManualKind, nextKind } from '@shared/domain/weighing'
+-import type { Operation, OperationType, ProductLine, WeighKind, WeightSample } from '@shared/types'
++import { isManualKind } from '@shared/domain/weighing'
++import type { Operation, OperationType, ProductLine, WeightSample } from '@shared/types'
+ import { api, call, errorMessage, formatDateTime, formatKg } from '../api'
+ import CaptureBox, { type CaptureRequest } from '../components/CaptureBox'
+ import ManualMark from '../components/ManualMark'
+@@ -53,8 +53,6 @@ export default function Balance2({ type }: { type: OperationType }) {
+   const [form, setForm] = useState<CompleteForm>(EMPTY_FORM)
+   const [lines, setLines] = useState<ProductLine[]>([])
+   const [locations, setLocations] = useState<Location[]>([])
+-  const [auto, setAuto] = useState(false)
+-  const [force, setForce] = useState(false)
+   // Camion repassé sur la balance : la 1re pesée du ticket choisi est à refaire.
+   const [redo, setRedo] = useState(false)
+   const [busy, setBusy] = useState(false)
+@@ -63,8 +61,6 @@ export default function Balance2({ type }: { type: OperationType }) {
+   const [preview, setPreview] = useState<{ id: number; html: string } | null>(null)
+ 
+   const ticketRef = useRef<Operation | null>(null)
+-  const redoRef = useRef(false)
+-  const secondKind = defaultKinds(type)[1]
+ 
+   const loadPending = useCallback(async (): Promise<void> => {
+     try {
+@@ -85,12 +81,7 @@ export default function Balance2({ type }: { type: OperationType }) {
+   }, [loadPending])
+ 
+   const captureSecond = useCallback(
+-    async (
+-      kind: WeighKind,
+-      weight: number,
+-      manual: boolean,
+-      source: WeightSample | null
+-    ): Promise<void> => {
++    async (weight: number, manual: boolean, source: WeightSample | null): Promise<void> => {
+       const current = ticketRef.current
+       if (!current) return
+       if (hasIncompleteLine(lines)) {
+@@ -111,7 +102,6 @@ export default function Balance2({ type }: { type: OperationType }) {
+         const updated = await call(
+           api.ops.capture({
+             operationId: current.id,
+-            kind,
+             weight,
+             isManual: manual,
+             stableMs: source?.stableMs ?? null,
+@@ -130,7 +120,7 @@ export default function Balance2({ type }: { type: OperationType }) {
+     [lines, form, t]
+   )
+ 
+-  /** La 1re pesée est refaite : même sens, nouveau poids ; l'ancienne reste tracée côté base. */
++  /** La 1re pesée est refaite : nouveau poids ; l'ancienne reste tracée côté base. */
+   const redoFirstNow = useCallback(
+     async (weight: number, manual: boolean, source: WeightSample | null): Promise<void> => {
+       const current = ticketRef.current
+@@ -141,7 +131,6 @@ export default function Balance2({ type }: { type: OperationType }) {
+         const updated = await call(
+           api.ops.redoFirst({
+             operationId: current.id,
+-            kind: current.first.kind,
+             weight,
+             isManual: manual,
+             stableMs: source?.stableMs ?? null,
+@@ -150,7 +139,6 @@ export default function Balance2({ type }: { type: OperationType }) {
+         )
+         ticketRef.current = updated
+         setSelected(updated)
+-        redoRef.current = false
+         setRedo(false)
+       } catch (err) {
+         setError(errorMessage(err))
+@@ -161,29 +149,14 @@ export default function Balance2({ type }: { type: OperationType }) {
+     []
+   )
+ 
+-  const balance = useBalance({
+-    enabled: () => auto,
+-    nextKind: () => {
+-      const first = ticketRef.current?.first
+-      if (!first || ticketRef.current?.second) return null
+-      return redoRef.current ? first.kind : nextKind(first.kind)
+-    },
+-    capture: (kind, sample) =>
+-      redoRef.current
+-        ? redoFirstNow(sample.weight, !sample.stable, sample)
+-        : captureSecond(kind, sample.weight, !sample.stable, sample),
+-    onError: setError
+-  })
++  const balance = useBalance(setError)
+ 
+   function startRedo(): void {
+-    redoRef.current = true
+     setRedo(true)
+     setError(null)
+-    balance.resetTrace()
+   }
+ 
+   function stopRedo(): void {
+-    redoRef.current = false
+     setRedo(false)
+   }
+ 
+@@ -211,7 +184,6 @@ export default function Balance2({ type }: { type: OperationType }) {
+     setLines(
+       op.lines.length > 0 ? op.lines.map((l) => ({ ...l })) : [{ productCode: '', quantityKg: 0 }]
+     )
+-    balance.resetTrace(op.first?.weight ?? null)
+     setConfirmSave(false)
+     setError(null)
+   }
+@@ -269,18 +241,15 @@ export default function Balance2({ type }: { type: OperationType }) {
+ 
+   async function captureNow(request: CaptureRequest): Promise<void> {
+     if (!selected?.first) return
+-    const source = request.typed ? null : balance.sample
++    const source = request.manual ? null : balance.sample
+     if (redo) await redoFirstNow(request.weight, request.manual, source)
+-    else await captureSecond(secondKind, request.weight, request.manual, source)
++    else await captureSecond(request.weight, request.manual, source)
+   }
+ 
+   const complete = selected?.second != null
+   const closed = selected != null && selected.status !== 'OUVERTE'
+   const incomplete = hasIncompleteLine(lines)
+ 
+-  const kindLabel = (kind: WeighKind): string =>
+-    t(kind === 'TARE' ? 'station.kind.TARE' : 'station.kind.BRUT')
+-
+   const locationOptions = (
+     <>
+       <option value="">{t('station.outside')}</option>
+@@ -306,13 +275,6 @@ export default function Balance2({ type }: { type: OperationType }) {
+               {t('bal.start')}
+             </button>
+           )}
+-          {selected?.first && !complete && (
+-            <p className="muted">
+-              {t('station.nextWeigh', {
+-                kind: kindLabel(redo ? selected.first.kind : secondKind)
+-              })}
+-            </p>
+-          )}
+         </div>
+         {balance.simulated && <SimulatorPanel />}
+ 
+@@ -321,16 +283,10 @@ export default function Balance2({ type }: { type: OperationType }) {
+         {selected && !complete && (
+           <>
+             <CaptureBox
+-              label={
+-                redo ? t('bal.redoCapture') : `${t('bal2.capture')} — ${kindLabel(secondKind)}`
+-              }
++              label={redo ? t('bal.redoCapture') : t('bal2.capture')}
+               sample={balance.sample}
+               busy={busy}
+               blocked={!redo && incomplete}
+-              auto={auto}
+-              onAuto={setAuto}
+-              force={force}
+-              onForce={setForce}
+               onCapture={(request) => void captureNow(request)}
+               onCancel={redo ? stopRedo : undefined}
+             />
+@@ -368,9 +324,7 @@ export default function Balance2({ type }: { type: OperationType }) {
+                     <td>{op.plate || '—'}</td>
+                     <td>
+                       {formatKg(op.first?.weight, lang)}
+-                      <small className="muted">
+-                        {op.first ? ` · ${kindLabel(op.first.kind)}` : ''}
+-                      </small>
++                      {op.first?.isManual && <ManualMark />}
+                     </td>
+                     <td>
+                       <button type="button" className="primary" onClick={() => choose(op)}>
+@@ -414,9 +368,6 @@ export default function Balance2({ type }: { type: OperationType }) {
+                 <p>
+                   <strong>{formatKg(selected.first?.weight, lang)}</strong>
+                   {selected.first?.isManual && <ManualMark />}
+-                  <small className="muted">
+-                    {selected.first ? ` · ${kindLabel(selected.first.kind)}` : ''}
+-                  </small>
+                 </p>
+               </div>
+             </div>
+diff --git a/src/renderer/src/styles.css b/src/renderer/src/styles.css
+index edf99b5..1ac6719 100644
+--- a/src/renderer/src/styles.css
++++ b/src/renderer/src/styles.css
+@@ -213,7 +213,6 @@ main {
+   font-size: 13px;
+ }
+ 
+-
+ .center-page {
+   display: flex;
+   flex-direction: column;
+diff --git a/src/shared/channels.ts b/src/shared/channels.ts
+index a51cb64..9d0c060 100644
+--- a/src/shared/channels.ts
++++ b/src/shared/channels.ts
+@@ -13,8 +13,7 @@ import type {
+   ProductLine,
+   SessionUser,
+   TicketDraft,
+-  WeightSample,
+-  WeighKind
++  WeightSample
+ } from './types'
+ 
+ export const CH = {
+@@ -99,7 +98,6 @@ export interface OpFilter {
+ 
+ export interface CaptureInput {
+   operationId: number
+-  kind: WeighKind
+   weight: number
+   /** Pesée saisie à la main (balance muette) : tracée comme telle. */
+   isManual: boolean
+diff --git a/src/shared/domain/weighing.test.ts b/src/shared/domain/weighing.test.ts
+index 8a9ea2b..8c21b2c 100644
+--- a/src/shared/domain/weighing.test.ts
++++ b/src/shared/domain/weighing.test.ts
+@@ -2,33 +2,17 @@ import { describe, expect, it } from 'vitest'
+ import {
+   computeTicket,
+   counterScope,
+-  defaultKinds,
+   formatTicketNo,
+   isManualKind,
+-  nextKind,
+   productKnownAtFirstWeighing,
+   roundKg
+ } from './weighing'
+ import type { Weighing } from '../types'
+ 
+-const w = (kind: Weighing['kind'], weight: number): Weighing => ({
+-  kind,
++const w = (weight: number, isManual = false): Weighing => ({
+   weight,
+-  at: '2026-10-16T08:00:00.000Z'
+-})
+-
+-describe('defaultKinds', () => {
+-  it('pèse le brut en premier à l’entrée, la tare en premier à la sortie', () => {
+-    expect(defaultKinds('ENTREE')).toEqual(['BRUT', 'TARE'])
+-    expect(defaultKinds('SORTIE')).toEqual(['TARE', 'BRUT'])
+-    expect(defaultKinds('TRANSFERT')).toEqual(['TARE', 'BRUT'])
+-    expect(defaultKinds('TIERS')).toEqual(['TARE', 'BRUT'])
+-  })
+-
+-  it('inverse le sens pour la deuxième pesée', () => {
+-    expect(nextKind('TARE')).toBe('BRUT')
+-    expect(nextKind('BRUT')).toBe('TARE')
+-  })
++  at: '2026-10-16T08:00:00.000Z',
++  isManual
+ })
+ 
+ describe('roundKg', () => {
+@@ -40,10 +24,10 @@ describe('roundKg', () => {
+ })
+ 
+ describe('computeTicket', () => {
+-  it('soustrait la tare du brut et calcule l’écart', () => {
++  it('prend le plus haut moins le plus bas, camion pesé chargé d’abord', () => {
+     const result = computeTicket({
+-      first: w('BRUT', 5000),
+-      second: w('TARE', 2000),
++      first: w(5000),
++      second: w(2000),
+       weightSupposed: 2950,
+       toleranceKg: 60
+     })
+@@ -57,10 +41,27 @@ describe('computeTicket', () => {
+     })
+   })
+ 
++  it('donne le même résultat quand le camion est pesé à vide d’abord', () => {
++    const result = computeTicket({ first: w(2000), second: w(5000), weightSupposed: 2950 })
++    expect(result.ok && result.netWeight).toBe(3000)
++    expect(result.ok && result.grossWeight).toBe(5000)
++    expect(result.ok && result.tareWeight).toBe(2000)
++  })
++
++  it('ne donne jamais un net négatif, quel que soit l’ordre des pesées', () => {
++    const result = computeTicket({ first: w(2000), second: w(5000) })
++    expect(result.ok && result.netWeight).toBeGreaterThanOrEqual(0)
++  })
++
++  it('accepte deux pesées égales : net nul', () => {
++    const result = computeTicket({ first: w(4000), second: w(4000) })
++    expect(result.ok && result.netWeight).toBe(0)
++  })
++
+   it('signale un écart hors tolérance', () => {
+     const result = computeTicket({
+-      first: w('TARE', 2000),
+-      second: w('BRUT', 5000),
++      first: w(2000),
++      second: w(5000),
+       weightSupposed: 2950,
+       toleranceKg: 20
+     })
+@@ -69,50 +70,28 @@ describe('computeTicket', () => {
+   })
+ 
+   it('donne un écart négatif quand le net est inférieur au supposé', () => {
+-    const result = computeTicket({
+-      first: w('TARE', 2000),
+-      second: w('BRUT', 2900),
+-      weightSupposed: 1000
+-    })
++    const result = computeTicket({ first: w(2000), second: w(2900), weightSupposed: 1000 })
+     expect(result.ok && result.ecart).toBe(-100)
+   })
+ 
+   it('ne juge pas l’écart sans poids supposé', () => {
+-    const result = computeTicket({ first: w('TARE', 2000), second: w('BRUT', 5000) })
++    const result = computeTicket({ first: w(2000), second: w(5000) })
+     expect(result.ok && result.ecart).toBeNull()
+     expect(result.ok && result.ecartOk).toBeNull()
+   })
+ 
+   it('ne juge pas l’écart sans tolérance configurée', () => {
+-    const result = computeTicket({
+-      first: w('TARE', 2000),
+-      second: w('BRUT', 5000),
+-      weightSupposed: 1000
+-    })
++    const result = computeTicket({ first: w(2000), second: w(5000), weightSupposed: 1000 })
+     expect(result.ok && result.ecart).toBe(2000)
+     expect(result.ok && result.ecartOk).toBeNull()
+   })
+ 
+   it('refuse un ticket incomplet', () => {
+-    expect(computeTicket({ first: w('TARE', 2000), second: null })).toEqual({
++    expect(computeTicket({ first: w(2000), second: null })).toEqual({
+       ok: false,
+       reason: 'INCOMPLET'
+     })
+   })
+-
+-  it('refuse deux pesées du même sens', () => {
+-    expect(computeTicket({ first: w('TARE', 2000), second: w('TARE', 2100) })).toEqual({
+-      ok: false,
+-      reason: 'SENS_INVALIDE'
+-    })
+-  })
+-
+-  it('refuse une tare supérieure au brut au lieu d’enregistrer un net négatif', () => {
+-    expect(computeTicket({ first: w('BRUT', 2000), second: w('TARE', 5000) })).toEqual({
+-      ok: false,
+-      reason: 'NET_NEGATIF'
+-    })
+-  })
+ })
+ 
+ describe('numérotation', () => {
+@@ -140,20 +119,19 @@ describe('productKnownAtFirstWeighing', () => {
+ })
+ 
+ describe('isManualKind', () => {
+-  const first: Weighing = { kind: 'BRUT', weight: 12000, at: 'x', isManual: true }
+-  const second: Weighing = { kind: 'TARE', weight: 7000, at: 'y', isManual: false }
+-
+-  it('retrouve la pesée du bon sens, que ce soit la 1re ou la 2e', () => {
+-    expect(isManualKind({ first, second }, 'BRUT')).toBe(true)
+-    expect(isManualKind({ first, second }, 'TARE')).toBe(false)
+-    // sortie : la tare passe en premier
+-    expect(isManualKind({ first: second, second: first }, 'BRUT')).toBe(true)
+-  })
+-
+-  it("est faux quand la pesée manque ou n'a pas de marqueur", () => {
+-    expect(isManualKind({ first: null, second: null }, 'BRUT')).toBe(false)
+-    expect(
+-      isManualKind({ first: { kind: 'BRUT', weight: 1, at: 'z' }, second: null }, 'BRUT')
+-    ).toBe(false)
++  it('rattache « M » au brut ou à la tare selon le poids, pas selon l’ordre', () => {
++    const heavyManual = w(12000, true)
++    const lightAuto = w(7000, false)
++    // camion pesé chargé d'abord, puis à vide
++    expect(isManualKind({ first: heavyManual, second: lightAuto }, 'BRUT')).toBe(true)
++    expect(isManualKind({ first: heavyManual, second: lightAuto }, 'TARE')).toBe(false)
++    // pesé à vide d'abord, puis chargé : mêmes poids, mêmes résultats
++    expect(isManualKind({ first: lightAuto, second: heavyManual }, 'BRUT')).toBe(true)
++    expect(isManualKind({ first: lightAuto, second: heavyManual }, 'TARE')).toBe(false)
++  })
++
++  it('est faux tant que les deux pesées ne sont pas faites', () => {
++    expect(isManualKind({ first: w(1, true), second: null }, 'BRUT')).toBe(false)
++    expect(isManualKind({ first: null, second: null }, 'TARE')).toBe(false)
+   })
+ })
+diff --git a/src/shared/domain/weighing.ts b/src/shared/domain/weighing.ts
+index 90c10f2..1fccfd8 100644
+--- a/src/shared/domain/weighing.ts
++++ b/src/shared/domain/weighing.ts
+@@ -6,54 +6,40 @@ export function roundKg(value: number): number {
+ }
+ 
+ /**
+- * Sens de pesée par défaut.
+- *
+- * ENTREE : le camion arrive chargé, on le pèse (BRUT), il décharge, on le repèse
+- *          vide (TARE).
+- * SORTIE / TRANSFERT / TIERS : le camion est pesé vide (TARE), on le charge, on
+- *          le repèse (BRUT). Un transfert interne suit la sortie : le camion part
+- *          chargé de l'origine et repart vide de la destination.
++ * Aucun sens n'est imposé aux deux pesées : le camion peut arriver chargé ou à
++ * vide, et revenir peser s'il avait oublié de le faire avant le chargement.
++ * Le brut est donc toujours la plus HAUTE des deux pesées et la tare la plus
++ * BASSE ; le net est leur différence.
+  */
+-const DEFAULT_KINDS: Record<OperationType, [WeighKind, WeighKind]> = {
+-  ENTREE: ['BRUT', 'TARE'],
+-  SORTIE: ['TARE', 'BRUT'],
+-  TRANSFERT: ['TARE', 'BRUT'],
+-  TIERS: ['TARE', 'BRUT']
+-}
+-
+-export function defaultKinds(type: OperationType): [WeighKind, WeighKind] {
+-  return DEFAULT_KINDS[type]
++function heaviest(first: Weighing, second: Weighing): { gross: Weighing; tare: Weighing } {
++  return first.weight >= second.weight
++    ? { gross: first, tare: second }
++    : { gross: second, tare: first }
+ }
+ 
+ /**
+- * Le poids de ce sens (BRUT ou TARE) a-t-il été saisi à la main ? Sert à afficher
+- * « M » à côté du brut ou de la tare, quelle que soit la pesée (1re ou 2e) qui les porte.
++ * Le brut (ou la tare) vient-il d'un poids saisi à la main ? Sert à afficher « M »
++ * à côté du brut ou de la tare, quelle que soit la pesée (1re ou 2e) qui les porte.
+  */
+ export function isManualKind(
+   op: { first: Weighing | null; second: Weighing | null },
+   kind: WeighKind
+ ): boolean {
+-  for (const w of [op.first, op.second]) {
+-    if (w?.kind === kind) return w.isManual === true
+-  }
+-  return false
++  if (!op.first || !op.second) return false
++  const { gross, tare } = heaviest(op.first, op.second)
++  return (kind === 'BRUT' ? gross : tare).isManual === true
+ }
+ 
+ /**
+  * Le produit est-il connu quand le camion arrive sur la 1re balance ?
+  * ENTREE : oui, la marchandise vient avec son bon de livraison, l'opérateur peut
+- * saisir produit et quantité tout de suite. Pour les autres types le camion
+- * arrive à vide : le produit n'est connu qu'une fois chargé, à la 2e balance.
++ * saisir produit et quantité tout de suite. Pour les autres types la
++ * marchandise n'est connue qu'au chargement : le produit se saisit à la 2e balance.
+  */
+ export function productKnownAtFirstWeighing(type: OperationType): boolean {
+   return type === 'ENTREE'
+ }
+ 
+-/** Le sens de la 2e pesée est forcément l'autre : on ne pèse pas deux fois un brut. */
+-export function nextKind(firstKind: WeighKind): WeighKind {
+-  return firstKind === 'BRUT' ? 'TARE' : 'BRUT'
+-}
+-
+ export type TicketComputation =
+   | {
+       ok: true
+@@ -64,10 +50,10 @@ export type TicketComputation =
+       /** null = pas de poids supposé ou pas de tolérance : rien à juger. */
+       ecartOk: boolean | null
+     }
+-  | { ok: false; reason: 'INCOMPLET' | 'NET_NEGATIF' | 'SENS_INVALIDE' }
++  | { ok: false; reason: 'INCOMPLET' }
+ 
+ /**
+- * Calcule les poids dérivés du ticket. Fonction pure : pas d'Electron, pas de
++ * Calcule les poids dérivés du ticket, quel que soit l'ordre des deux pesées. Fonction pure : pas d'Electron, pas de
+  * MySQL, donc testable et réutilisable côté client.
+  */
+ export function computeTicket(input: {
+@@ -79,16 +65,13 @@ export function computeTicket(input: {
+   const { first, second, weightSupposed = null, toleranceKg = null } = input
+ 
+   if (!first || !second) return { ok: false, reason: 'INCOMPLET' }
+-  if (first.kind === second.kind) return { ok: false, reason: 'SENS_INVALIDE' }
+ 
+-  const grossWeight = first.kind === 'BRUT' ? first.weight : second.weight
+-  const tareWeight = first.kind === 'TARE' ? first.weight : second.weight
++  // Le net ne peut pas être négatif : le plus haut moins le plus bas.
++  const { gross, tare } = heaviest(first, second)
++  const grossWeight = gross.weight
++  const tareWeight = tare.weight
+   const netWeight = roundKg(grossWeight - tareWeight)
+ 
+-  // Une tare supérieure au brut est une erreur de saisie ou de pont : refuser
+-  // plutôt qu'enregistrer un net négatif dans les comptes.
+-  if (netWeight < 0) return { ok: false, reason: 'NET_NEGATIF' }
+-
+   const ecart = weightSupposed == null ? null : roundKg(netWeight - weightSupposed)
+   const ecartOk = ecart == null || toleranceKg == null ? null : Math.abs(ecart) <= toleranceKg
+ 
+diff --git a/src/shared/schemas.ts b/src/shared/schemas.ts
+index 8a097c2..77bfccc 100644
+--- a/src/shared/schemas.ts
++++ b/src/shared/schemas.ts
+@@ -6,7 +6,7 @@
+  * Utilisé uniquement par le processus principal (dépend de zod).
+  */
+ import { z } from 'zod'
+-import { OPERATION_TYPES, WEIGH_KINDS } from './types'
++import { OPERATION_TYPES } from './types'
+ 
+ export const dbConfigSchema = z.object({
+   host: z.string().trim().min(1).max(255),
+@@ -63,7 +63,6 @@ export const ticketDraftSchema = z.object({
+ 
+ export const captureSchema = z.object({
+   operationId: z.number().int().positive(),
+-  kind: z.enum(WEIGH_KINDS),
+   weight: z.number().min(-1000).max(1_000_000),
+   isManual: z.boolean(),
+   stableMs: z.number().int().min(0).nullish(),
+diff --git a/src/shared/types.ts b/src/shared/types.ts
+index f46aafd..41be453 100644
+--- a/src/shared/types.ts
++++ b/src/shared/types.ts
+@@ -43,7 +43,6 @@ export interface TicketDraft {
+ }
+ 
+ export interface Weighing {
+-  kind: WeighKind
+   weight: number
+   /** ISO 8601 */
+   at: string
+@@ -57,7 +56,6 @@ export interface Operation extends TicketDraft {
+   id: number
+   ticketNo: string
+   status: OperationStatus
+-  allKinds: [WeighKind, WeighKind]
+   first: Weighing | null
+   second: Weighing | null
+   /** Somme des lignes, figée à la 2e pesée. */

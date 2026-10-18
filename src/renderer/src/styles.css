@@ -1,0 +1,880 @@
+/* Interface sobre, pensée pour un écran de poste : le poids doit se lire à
+   plusieurs mètres, le reste est secondaire. Le sens RTL vient de html[dir]. */
+
+:root {
+  --bg: #0f172a;
+  --panel: #1e293b;
+  --panel-2: #273449;
+  --line: #334155;
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+  --accent: #22c55e;
+  --accent-2: #38bdf8;
+  --danger: #ef4444;
+  --warn: #f59e0b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Segoe UI', 'Noto Naskh Arabic', system-ui, sans-serif;
+  font-size: 15px;
+}
+
+h1,
+h2 {
+  margin: 0 0 12px;
+  font-size: 18px;
+}
+
+p {
+  margin: 6px 0;
+}
+
+/* ---------- Structure ---------- */
+.shell {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 220px;
+  flex: none;
+  padding: 16px 12px;
+  background: var(--panel);
+  border-inline-end: 1px solid var(--line);
+}
+
+.sidebar nav {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+}
+
+.sidebar .menu {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.sidebar .menu-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+.sidebar .menu-title.open {
+  color: var(--text);
+}
+
+.sidebar .submenu {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-inline-start: 10px;
+  padding-inline-start: 8px;
+  border-inline-start: 1px solid var(--line);
+}
+
+.sidebar a {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text);
+  text-decoration: none;
+  padding: 12px 12px;
+  border-radius: 10px;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.sidebar a.active {
+  background: var(--panel-2);
+  color: var(--accent-2);
+}
+
+/* Entrées/sorties : chaque type garde sa couleur, plein quand il est actif. */
+.sidebar a[data-type] {
+  border-inline-start: 6px solid var(--type);
+}
+
+.sidebar a[data-type].active {
+  background: var(--type);
+  color: var(--type-ink);
+  font-weight: 800;
+  box-shadow: 0 0 0 3px var(--type-bg);
+}
+
+.sidebar .type-icon {
+  font-size: 20px;
+  width: 22px;
+  text-align: center;
+}
+
+.sidebar-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.brand {
+  font-weight: 700;
+  color: var(--accent-2);
+}
+
+.spacer {
+  flex: 1;
+}
+
+main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 14px 18px;
+  min-width: 0;
+  height: 100vh;
+  overflow: hidden;
+  background: linear-gradient(180deg, var(--type-bg, transparent), transparent 240px);
+}
+
+/* Contenu sous le bandeau : seul lui défile (liste de tickets, paramètres). */
+.page {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  animation: page-in 0.25s ease-out;
+}
+
+/* ---------- Aperçu du ticket ---------- */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(2, 6, 23, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 10;
+}
+
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 16px;
+  width: min(420px, 100%);
+}
+
+.ticket-frame {
+  width: 100%;
+  height: 60vh;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.actions {
+  margin-top: 0;
+  flex-wrap: wrap;
+}
+
+.actions input {
+  max-width: 160px;
+}
+
+.actions button {
+  padding: 5px 10px;
+  font-size: 13px;
+}
+
+.center-page {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  min-height: 100vh;
+  padding: 24px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 18px;
+  margin-bottom: 18px;
+  width: 100%;
+}
+
+.card.login {
+  max-width: 420px;
+}
+
+.settings {
+  max-width: 1100px;
+}
+
+/* ---------- Formulaires ---------- */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+label.inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+}
+
+input,
+select,
+textarea {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 8px 10px;
+  font: inherit;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  outline: 2px solid var(--accent-2);
+}
+
+button {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 8px 14px;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent-2);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--type, var(--accent));
+  border-color: var(--type, var(--accent));
+  color: var(--type-ink, #052e16);
+  font-weight: 700;
+  padding: 10px 18px;
+}
+
+button.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
+button.ghost {
+  background: transparent;
+}
+
+button.link {
+  background: none;
+  border: none;
+  color: var(--accent-2);
+  text-decoration: underline;
+  padding: 0;
+}
+
+button.chip {
+  border-radius: 999px;
+  padding: 6px 14px;
+}
+
+button.chip.active {
+  background: var(--accent-2);
+  border-color: var(--accent-2);
+  color: #082f49;
+  font-weight: 700;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.types {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+/* ---------- Poste de pesée ---------- */
+.station {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(340px, 42%) 1fr;
+  gap: 16px;
+}
+
+.readout {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  background: linear-gradient(180deg, var(--panel), #16202f);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px 18px;
+}
+
+.weight {
+  font-size: clamp(40px, 4.6vw, 80px);
+  line-height: 1;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  letter-spacing: -1px;
+}
+
+.test-weight {
+  font-size: 28px;
+  font-variant-numeric: tabular-nums;
+}
+
+.test-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.raw {
+  background: #0b1220;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: var(--accent-2);
+  max-width: 55%;
+  overflow-wrap: anywhere;
+}
+
+.ticket-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+  font-size: 20px;
+}
+
+.weighings,
+.totals {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.weigh,
+.totals > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.weigh strong,
+.totals strong {
+  font-size: 24px;
+  font-variant-numeric: tabular-nums;
+}
+
+.totals .net {
+  color: var(--accent);
+}
+
+/* ---------- Produits du ticket ---------- */
+.lines-editor {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.lines-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.line-row {
+  margin-top: 8px;
+}
+
+.line-row input:first-child {
+  flex: 1;
+  min-width: 160px;
+}
+
+.line-row input[type='number'] {
+  width: 120px;
+}
+
+.lines-readonly {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.lines-readonly .row {
+  justify-content: space-between;
+  margin-top: 4px;
+}
+
+/* ---------- Tableaux ---------- */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+th,
+td {
+  text-align: start;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
+}
+
+th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 13px;
+}
+
+tr.cancelled {
+  opacity: 0.5;
+  text-decoration: line-through;
+}
+
+/* ---------- Messages ---------- */
+.muted {
+  color: var(--muted);
+}
+
+.ok {
+  color: var(--accent);
+}
+
+.error {
+  color: var(--danger);
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+.warn-box {
+  color: var(--warn);
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+.badge {
+  display: inline-block;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12px;
+  color: var(--muted);
+  margin-inline-start: 6px;
+}
+
+.badge.ok {
+  color: var(--accent);
+  border-color: rgba(34, 197, 94, 0.5);
+}
+
+.badge.warn {
+  color: var(--warn);
+  border-color: rgba(245, 158, 11, 0.5);
+}
+
+/* ---------- Simulateur de balance ---------- */
+.sim-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--panel);
+  border: 1px dashed rgba(245, 158, 11, 0.5);
+  border-radius: 12px;
+  padding: 14px;
+}
+
+/* ---------- Couleur par type de pesée ---------- */
+[data-type='ENTREE'] {
+  --type: #4ade80;
+  --type-ink: #052e16;
+  --type-bg: rgba(74, 222, 128, 0.14);
+}
+
+[data-type='SORTIE'] {
+  --type: #fb923c;
+  --type-ink: #431407;
+  --type-bg: rgba(251, 146, 60, 0.16);
+}
+
+[data-type='TRANSFERT'] {
+  --type: #60a5fa;
+  --type-ink: #0b1b3a;
+  --type-bg: rgba(96, 165, 250, 0.16);
+}
+
+[data-type='TIERS'] {
+  --type: #c084fc;
+  --type-ink: #2e1065;
+  --type-bg: rgba(192, 132, 252, 0.16);
+}
+
+/* ---------- Bandeau du type + onglets ---------- */
+.type-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 18px;
+  background: var(--type);
+  color: var(--type-ink);
+  border-radius: 14px;
+}
+
+/* Deux jeux de noms identiques : changer de classe relance l'animation. */
+.type-bar.flip-0 {
+  animation:
+    type-pop 0.35s ease-out,
+    type-flash 0.8s ease-out;
+}
+
+.type-bar.flip-1 {
+  animation:
+    type-pop-2 0.35s ease-out,
+    type-flash-2 0.8s ease-out;
+}
+
+.type-bar .type-icon {
+  font-size: 34px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.type-title {
+  flex: 1;
+  min-width: 0;
+}
+
+.type-title h1 {
+  margin: 0;
+  font-size: 28px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
+.type-title p {
+  margin: 0;
+  font-weight: 600;
+  opacity: 0.85;
+}
+
+.tabs {
+  display: flex;
+  gap: 8px;
+}
+
+.tabs a {
+  padding: 12px 20px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.35);
+  color: var(--type-ink);
+  text-decoration: none;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.tabs a:hover {
+  background: rgba(255, 255, 255, 0.55);
+}
+
+.tabs a.active {
+  background: var(--type-ink);
+  color: #fff;
+}
+
+@keyframes type-pop {
+  from {
+    opacity: 0;
+    transform: translateX(-28px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes type-flash {
+  from {
+    box-shadow: 0 0 0 0 var(--type);
+  }
+  to {
+    box-shadow: 0 0 0 26px transparent;
+  }
+}
+
+@keyframes type-pop-2 {
+  from {
+    opacity: 0;
+    transform: translateX(-28px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes type-flash-2 {
+  from {
+    box-shadow: 0 0 0 0 var(--type);
+  }
+  to {
+    box-shadow: 0 0 0 26px transparent;
+  }
+}
+
+@keyframes page-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .type-bar,
+  .page {
+    animation: none;
+  }
+}
+
+/* ---------- Poste de pesée : colonne du poids / colonne du formulaire ---------- */
+.station-left,
+.station-right {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  min-width: 0;
+}
+
+.station-right {
+  overflow: auto;
+}
+
+.station-right .card {
+  margin-bottom: 0;
+}
+
+.capture-box {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+button.big {
+  width: 100%;
+  padding: 18px 20px;
+  font-size: 20px;
+  border-radius: 12px;
+}
+
+.checks {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 14px;
+}
+
+.actions-col {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.summary {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  padding: 10px 0 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.summary p {
+  margin: 2px 0;
+  font-size: 18px;
+}
+
+.hint-box {
+  color: var(--text);
+  background: var(--type-bg, var(--panel-2));
+  border: 1px dashed var(--type, var(--line));
+  border-radius: 10px;
+  padding: 12px 14px;
+  font-size: 16px;
+}
+
+/* ---------- Formulaire : une colonne, gros champs ---------- */
+.form-col {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.form-col label {
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 600;
+  gap: 5px;
+}
+
+.form-col input,
+.form-col select,
+.form-col textarea {
+  font-size: 18px;
+  padding: 11px 12px;
+  border-radius: 10px;
+}
+
+.form-col textarea {
+  resize: none;
+}
+
+/* ---------- Produits : une ligne = produit | quantité | retirer ---------- */
+.lines-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.line-grid {
+  display: grid;
+  grid-template-columns: 1fr 180px 46px;
+  gap: 8px;
+  align-items: center;
+}
+
+.line-cols {
+  font-size: 13px;
+}
+
+.icon-btn {
+  padding: 10px 0;
+  font-size: 16px;
+}
+
+.add-line {
+  align-self: flex-start;
+  font-weight: 600;
+}
+
+@media (max-width: 1100px) {
+  .station {
+    grid-template-columns: 1fr;
+    overflow: auto;
+  }
+
+  .type-bar {
+    flex-wrap: wrap;
+  }
+}
+
+/* ---------- Pesée manuelle : repère « M » et saisie ---------- */
+.manual-mark {
+  display: inline-block;
+  margin-inline-start: 6px;
+  padding: 0 6px;
+  border: 1px solid var(--warn);
+  border-radius: 4px;
+  color: var(--warn);
+  font-size: 0.6em;
+  font-weight: 800;
+  vertical-align: middle;
+}
+
+.manual-input {
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.manual-input input {
+  font-size: 28px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  font-variant-numeric: tabular-nums;
+}
