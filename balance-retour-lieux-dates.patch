@@ -1,0 +1,1539 @@
+From 8c61be291f17b464a751fee00b781d309473e0e4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 20:23:47 +0100
+Subject: [PATCH 1/2] Lieux selon le type de ticket et cas Retour
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- SORTIE : aucun lieu à saisir (départ = stock central, arrivée = extérieur)
+- ENTREE : seul l'emplacement de dépose est demandé (stock central par défaut)
+- Case Retour (entrée : retour client, sortie : renvoi fournisseur), migration 005
+- Règle partagée src/shared/domain/locations.ts, appliquée aussi côté serveur
+- Ticket imprimé : lieux pertinents seulement, mention RETOUR
+- Tests unitaires et d'intégration
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016BJ1sCkcEcDNZYYUKRi2LY
+---
+ migrations/005_retour.sql                     |  11 ++
+ src/main/db/migrate.ts                        |   4 +-
+ src/main/db/operations.integration.test.ts    | 115 ++++++++++++++++++
+ src/main/db/operations.ts                     |  84 ++++++++++---
+ src/main/ticket-html.test.ts                  |  37 +++++-
+ src/main/ticket-html.ts                       |  15 ++-
+ .../src/components/LocationPickers.tsx        |  87 +++++++++++++
+ src/renderer/src/components/RetourToggle.tsx  |  42 +++++++
+ src/renderer/src/i18n.tsx                     |   8 ++
+ src/renderer/src/pages/Balance1.tsx           |   9 +-
+ src/renderer/src/pages/Balance2.tsx           |  80 ++++++------
+ src/renderer/src/pages/Operations.tsx         |  68 +++++++----
+ src/renderer/src/styles.css                   |   4 +-
+ src/shared/channels.ts                        |   1 +
+ src/shared/domain/locations.test.ts           |  83 +++++++++++++
+ src/shared/domain/locations.ts                |  58 +++++++++
+ src/shared/schemas.ts                         |   2 +
+ src/shared/types.ts                           |   6 +
+ 18 files changed, 628 insertions(+), 86 deletions(-)
+ create mode 100644 migrations/005_retour.sql
+ create mode 100644 src/renderer/src/components/LocationPickers.tsx
+ create mode 100644 src/renderer/src/components/RetourToggle.tsx
+ create mode 100644 src/shared/domain/locations.test.ts
+ create mode 100644 src/shared/domain/locations.ts
+
+diff --git a/migrations/005_retour.sql b/migrations/005_retour.sql
+new file mode 100644
+index 0000000..fae8839
+--- /dev/null
++++ b/migrations/005_retour.sql
+@@ -0,0 +1,11 @@
++-- 005 — Cas « retour ».
++--
++-- Un retour est une entrée ou une sortie ordinaire (la marchandise bouge dans le
++-- même sens, donc `v_stock_moves` n'a pas à changer) mais l'opérateur doit le
++-- distinguer :
++--   ENTREE + retour : marchandise vendue qui revient d'un client ;
++--   SORTIE + retour : marchandise achetée renvoyée au fournisseur (ex. un CMV).
++-- Le drapeau est affiché sur l'écran, la liste et le ticket imprimé.
++
++ALTER TABLE operations
++  ADD COLUMN is_retour TINYINT(1) NOT NULL DEFAULT 0 AFTER type;
+diff --git a/src/main/db/migrate.ts b/src/main/db/migrate.ts
+index 75cb401..a625016 100644
+--- a/src/main/db/migrate.ts
++++ b/src/main/db/migrate.ts
+@@ -10,12 +10,14 @@ import init001 from '../../../migrations/001_init.sql?raw'
+ import lines002 from '../../../migrations/002_operation_lines.sql?raw'
+ import manual003 from '../../../migrations/003_manual_and_redo.sql?raw'
+ import freeOrder004 from '../../../migrations/004_free_weighing_order.sql?raw'
++import retour005 from '../../../migrations/005_retour.sql?raw'
+ 
+ const MIGRATIONS: ReadonlyArray<{ version: string; sql: string }> = [
+   { version: '001_init', sql: init001 },
+   { version: '002_operation_lines', sql: lines002 },
+   { version: '003_manual_and_redo', sql: manual003 },
+-  { version: '004_free_weighing_order', sql: freeOrder004 }
++  { version: '004_free_weighing_order', sql: freeOrder004 },
++  { version: '005_retour', sql: retour005 }
+ ]
+ 
+ export async function migrate(cfg: DbConfig): Promise<string[]> {
+diff --git a/src/main/db/operations.integration.test.ts b/src/main/db/operations.integration.test.ts
+index b0752da..e32d1d1 100644
+--- a/src/main/db/operations.integration.test.ts
++++ b/src/main/db/operations.integration.test.ts
+@@ -398,4 +398,119 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
+       operations.redoFirst({ operationId: empty.id, weight: 4100, isManual: false }, user, 'p')
+     ).rejects.toThrow(/2e pesée est déjà faite/)
+   })
++  describe('lieux et retours', () => {
++    const idOf = async (code: string): Promise<number> => {
++      const [rows] = await pool
++        .getPool()
++        .query<RowDataPacket[]>('SELECT id FROM locations WHERE code = ?', [code])
++      return Number(rows[0]?.id)
++    }
++
++    it("SORTIE : part du stock central vers l'extérieur, quels que soient les lieux envoyés", async () => {
++      const central = await idOf('STOCK')
++      const unitA = await idOf('UNITE_A')
++
++      const ticket = await operations.create(
++        { type: 'SORTIE', locationFromId: unitA, locationToId: unitA },
++        user
++      )
++      expect(ticket.isRetour).toBe(false)
++      expect(ticket.locationFromId).toBe(central)
++      expect(ticket.locationToId).toBeNull()
++
++      const updated = await operations.update(ticket.id, { locationToId: unitA }, user)
++      expect(updated.locationFromId).toBe(central)
++      expect(updated.locationToId).toBeNull()
++    })
++
++    it("ENTREE : l'arrivée choisie est gardée, à défaut le stock central ; jamais d'origine", async () => {
++      const central = await idOf('STOCK')
++      const unitB = await idOf('UNITE_B')
++
++      const defaulted = await operations.create({ type: 'ENTREE' }, user)
++      expect(defaulted.locationFromId).toBeNull()
++      expect(defaulted.locationToId).toBe(central)
++
++      const chosen = await operations.create({ type: 'ENTREE', locationToId: unitB }, user)
++      expect(chosen.locationToId).toBe(unitB)
++
++      const retouched = await operations.update(
++        chosen.id,
++        { locationFromId: unitB, locationToId: central },
++        user
++      )
++      expect(retouched.locationFromId).toBeNull()
++      expect(retouched.locationToId).toBe(central)
++    })
++
++    it('SORTIE en retour : sort du lieu choisi ; décocher le retour la ramène au stock central', async () => {
++      const central = await idOf('STOCK')
++      const unitA = await idOf('UNITE_A')
++
++      const ticket = await operations.create({ type: 'SORTIE', isRetour: true }, user)
++      expect(ticket.isRetour).toBe(true)
++      expect(ticket.locationFromId).toBe(central)
++
++      const fromUnit = await operations.update(ticket.id, { locationFromId: unitA }, user)
++      expect(fromUnit.locationFromId).toBe(unitA)
++
++      const normal = await operations.update(ticket.id, { isRetour: false }, user)
++      expect(normal.isRetour).toBe(false)
++      expect(normal.locationFromId).toBe(central)
++    })
++
++    it("TRANSFERT : les deux lieux restent ceux de l'opérateur", async () => {
++      const unitA = await idOf('UNITE_A')
++      const unitB = await idOf('UNITE_B')
++      const ticket = await operations.create(
++        { type: 'TRANSFERT', locationFromId: unitA, locationToId: unitB },
++        user
++      )
++      expect(ticket.locationFromId).toBe(unitA)
++      expect(ticket.locationToId).toBe(unitB)
++    })
++
++    it('un retour fermé bouge le stock dans le même sens qu’un ticket ordinaire', async () => {
++      const unitA = await idOf('UNITE_A')
++      const central = await idOf('STOCK')
++
++      // retour client : la marchandise entre en unité A
++      const back = await operations.create(
++        {
++          type: 'ENTREE',
++          isRetour: true,
++          locationToId: unitA,
++          lines: [{ productCode: 'CMV RETOUR', quantityKg: 1000 }]
++        },
++        user
++      )
++      await operations.capture({ operationId: back.id, weight: 9000, isManual: false }, user, 'p')
++      await operations.capture({ operationId: back.id, weight: 8000, isManual: false }, user, 'p')
++      await operations.close(back.id, user)
++
++      // retour fournisseur : la marchandise sort du stock central
++      const away = await operations.create(
++        {
++          type: 'SORTIE',
++          isRetour: true,
++          lines: [{ productCode: 'CMV RETOUR', quantityKg: 500 }]
++        },
++        user
++      )
++      await operations.capture({ operationId: away.id, weight: 6000, isManual: false }, user, 'p')
++      await operations.capture({ operationId: away.id, weight: 6500, isManual: false }, user, 'p')
++      await operations.close(away.id, user)
++
++      const [moves] = await pool.getPool().query<RowDataPacket[]>(
++        `SELECT operation_id, location_id, qty_in, qty_out FROM v_stock_moves
++          WHERE operation_id IN (?) ORDER BY operation_id`,
++        [[back.id, away.id]]
++      )
++      expect(moves).toHaveLength(2)
++      expect(moves[0]).toMatchObject({ location_id: unitA })
++      expect(Number(moves[0]?.qty_in)).toBe(1000)
++      expect(moves[1]).toMatchObject({ location_id: central })
++      expect(Number(moves[1]?.qty_out)).toBe(500)
++    })
++  })
+ })
+diff --git a/src/main/db/operations.ts b/src/main/db/operations.ts
+index ae43d21..8da4e99 100644
+--- a/src/main/db/operations.ts
++++ b/src/main/db/operations.ts
+@@ -10,6 +10,7 @@
+  */
+ import type { PoolConnection, ResultSetHeader, RowDataPacket } from 'mysql2/promise'
+ import type { CaptureInput, Location, OpFilter, OpUpdate } from '@shared/channels'
++import { CENTRAL_LOCATION_CODE, resolveLocations } from '@shared/domain/locations'
+ import { computeTicket, counterScope, formatTicketNo } from '@shared/domain/weighing'
+ import type {
+   Operation,
+@@ -66,6 +67,15 @@ async function ensureVehicle(conn: PoolConnection, plate?: string | null): Promi
+   return rows[0] ? Number(rows[0].id) : null
+ }
+ 
++/** Le stock central : lieu par défaut quand l'opérateur n'a pas à choisir. */
++async function centralLocationId(conn: PoolConnection): Promise<number | null> {
++  const [rows] = await conn.query<RowDataPacket[]>(
++    'SELECT id FROM locations WHERE code = ? AND active = 1',
++    [CENTRAL_LOCATION_CODE]
++  )
++  return rows[0] ? Number(rows[0].id) : null
++}
++
+ /**
+  * Remplace la liste des produits d'un ticket (remplacement complet, pas de
+  * fusion : l'écran envoie toujours la liste entière).
+@@ -94,24 +104,33 @@ export async function create(draft: TicketDraft, user: SessionUser): Promise<Ope
+     await conn.beginTransaction()
+     const ticketNo = await allocateTicket(conn, draft.type)
+     const vehicleId = await ensureVehicle(conn, draft.plate)
++    const isRetour = draft.isRetour === true
++    const places = resolveLocations({
++      type: draft.type,
++      isRetour,
++      fromId: draft.locationFromId ?? null,
++      toId: draft.locationToId ?? null,
++      centralId: await centralLocationId(conn)
++    })
+ 
+     const [result] = await conn.query<ResultSetHeader>(
+       `INSERT INTO operations
+-         (ticket_no, type, status, vehicle_id, plate, driver_name,
++         (ticket_no, type, is_retour, status, vehicle_id, plate, driver_name,
+           partner_id, partner_name, location_from_id, location_to_id, bl_no, bl_date,
+           notes, operator_id)
+-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
++       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       [
+         ticketNo,
+         draft.type,
++        isRetour ? 1 : 0,
+         'OUVERTE',
+         vehicleId,
+         draft.plate?.trim().toUpperCase() || null,
+         draft.driverName?.trim() || null,
+         draft.partnerId ?? null,
+         draft.partnerName?.trim() || null,
+-        draft.locationFromId ?? null,
+-        draft.locationToId ?? null,
++        places.fromId,
++        places.toId,
+         draft.blNo?.trim() || null,
+         draft.blDate?.trim() || null,
+         draft.notes?.trim() || null,
+@@ -324,6 +343,7 @@ export async function close(id: number, user: SessionUser): Promise<Operation> {
+  * table `weighings` est la trace de ce qui a été pesé.
+  */
+ const UPDATABLE_COLUMNS: Record<keyof OpUpdate, string> = {
++  isRetour: 'is_retour',
+   plate: 'plate',
+   driverName: 'driver_name',
+   partnerName: 'partner_name',
+@@ -341,22 +361,53 @@ export async function update(id: number, patch: OpUpdate, user: SessionUser): Pr
+     if (!(key in patch)) continue
+     const value = patch[key as keyof OpUpdate] ?? null
+     sets.push(`${column} = ?`) // nom de colonne issu d'une table blanche, jamais du renderer
+-    params.push(key === 'plate' && typeof value === 'string' ? value.toUpperCase() : value)
++    if (key === 'isRetour') params.push(value === true ? 1 : 0)
++    else params.push(key === 'plate' && typeof value === 'string' ? value.toUpperCase() : value)
+   }
+   if (sets.length === 0) throw new Error('Aucune modification à enregistrer')
+ 
+-  params.push(id)
+-  const pool = getPool()
+-  const [result] = await pool.query<ResultSetHeader>(
+-    `UPDATE operations SET ${sets.join(', ')} WHERE id = ?`,
+-    params
+-  )
+-  if (result.affectedRows === 0) throw new Error('Ticket introuvable')
++  const conn = await getPool().getConnection()
++  try {
++    await conn.beginTransaction()
++    params.push(id)
++    const [result] = await conn.query<ResultSetHeader>(
++      `UPDATE operations SET ${sets.join(', ')} WHERE id = ?`,
++      params
++    )
++    if (result.affectedRows === 0) throw new Error('Ticket introuvable')
+ 
+-  await pool.query(
+-    `INSERT INTO audit_log (user_id, action, entity, entity_id, after_json) VALUES (?,?,?,?,?)`,
+-    [user.id, 'UPDATE', 'operations', String(id), JSON.stringify(patch)]
+-  )
++    // Les lieux se déduisent du type et du retour : changer l'un des deux (ou
++    // envoyer un lieu que ce type ne demande pas) ne doit pas laisser le stock
++    // pointer sur un lieu incohérent.
++    const [rows] = await conn.query<RowDataPacket[]>(
++      'SELECT type, is_retour, location_from_id, location_to_id FROM operations WHERE id = ?',
++      [id]
++    )
++    const row = rows[0]
++    if (!row) throw new Error('Ticket introuvable')
++    const places = resolveLocations({
++      type: row.type as OperationType,
++      isRetour: Boolean(Number(row.is_retour)),
++      fromId: row.location_from_id == null ? null : Number(row.location_from_id),
++      toId: row.location_to_id == null ? null : Number(row.location_to_id),
++      centralId: await centralLocationId(conn)
++    })
++    await conn.query(
++      'UPDATE operations SET location_from_id = ?, location_to_id = ? WHERE id = ?',
++      [places.fromId, places.toId, id]
++    )
++
++    await conn.query(
++      `INSERT INTO audit_log (user_id, action, entity, entity_id, after_json) VALUES (?,?,?,?,?)`,
++      [user.id, 'UPDATE', 'operations', String(id), JSON.stringify(patch)]
++    )
++    await conn.commit()
++  } catch (err) {
++    await conn.rollback().catch(() => undefined)
++    throw err
++  } finally {
++    conn.release()
++  }
+ 
+   const updated = await getById(id)
+   if (!updated) throw new Error('Ticket introuvable après modification')
+@@ -591,6 +642,7 @@ function toOperation(row: RowDataPacket): Operation {
+     ticketNo: String(row.ticket_no),
+     type,
+     status: row.status,
++    isRetour: Boolean(Number(row.is_retour ?? 0)),
+     plate: row.plate ?? null,
+     driverName: row.driver_name ?? null,
+     partnerId: num(row.partner_id),
+diff --git a/src/main/ticket-html.test.ts b/src/main/ticket-html.test.ts
+index 2bfc731..e50273b 100644
+--- a/src/main/ticket-html.test.ts
++++ b/src/main/ticket-html.test.ts
+@@ -8,6 +8,7 @@ function ticket(over: Partial<Operation> = {}): Operation {
+     ticketNo: 'E-2026-000001',
+     type: 'ENTREE',
+     status: 'FERMEE',
++    isRetour: false,
+     plate: '12345-A-100',
+     driverName: null,
+     partnerId: null,
+@@ -89,11 +90,43 @@ describe('ticket HTML', () => {
+     expect(html).not.toContain('NET PRODUIT')
+   })
+ 
+-  it("affiche « Extérieur » quand aucun lieu n'est renseigné", () => {
+-    const html = buildTicketHtml(ticket({ locationFromId: null }), opts)
++  it("affiche « Extérieur » quand un transfert n'a pas de lieu renseigné", () => {
++    const html = buildTicketHtml(ticket({ type: 'TRANSFERT', locationFromId: null }), opts)
++    expect(html).toContain('Origine')
+     expect(html).toContain('Extérieur')
+   })
+ 
++  it("n'imprime que l'arrivée sur une entrée", () => {
++    const html = buildTicketHtml(ticket(), opts)
++    expect(html).toContain('Destination')
++    expect(html).not.toContain('Origine')
++  })
++
++  it("n'imprime ni origine ni destination sur une sortie", () => {
++    const html = buildTicketHtml(
++      ticket({ type: 'SORTIE', locationFromId: 2, locationToId: null }),
++      opts
++    )
++    expect(html).not.toContain('Origine')
++    expect(html).not.toContain('Destination')
++    expect(html).not.toContain('Extérieur')
++  })
++
++  it("imprime l'origine d'une sortie en retour, et le marque RETOUR", () => {
++    const html = buildTicketHtml(
++      ticket({ type: 'SORTIE', isRetour: true, locationFromId: 2, locationToId: null }),
++      opts
++    )
++    expect(html).toContain('TICKET DE SORTIE — RETOUR')
++    expect(html).toContain('Origine')
++    expect(html).toContain('Stock central')
++    expect(html).not.toContain('Destination')
++  })
++
++  it("n'ajoute pas RETOUR à un ticket ordinaire", () => {
++    expect(buildTicketHtml(ticket(), opts)).not.toContain('RETOUR')
++  })
++
+   it('bascule en RTL et en arabe', () => {
+     const html = buildTicketHtml(ticket(), { ...opts, lang: 'ar' })
+     expect(html).toContain('dir="rtl"')
+diff --git a/src/main/ticket-html.ts b/src/main/ticket-html.ts
+index 16a3760..b620d41 100644
+--- a/src/main/ticket-html.ts
++++ b/src/main/ticket-html.ts
+@@ -9,6 +9,7 @@
+  * saisi à la main finirait sinon exécuté dans la fenêtre d'impression.
+  */
+ import type { Lang, Location } from '@shared/channels'
++import { asksFrom, asksTo, locationFieldsFor } from '@shared/domain/locations'
+ import { isManualKind } from '@shared/domain/weighing'
+ import type { Operation, OperationType } from '@shared/types'
+ 
+@@ -52,6 +53,7 @@ interface Labels {
+   station: string
+   outside: string
+   cancelled: string
++  retour: string
+   primaryTitle: string
+   waitingSecond: string
+   manualLegend: string
+@@ -84,6 +86,7 @@ const LABELS: Record<Lang, Labels> = {
+     station: 'Poste',
+     outside: 'Extérieur',
+     cancelled: 'TICKET ANNULÉ',
++    retour: 'RETOUR',
+     primaryTitle: 'BON DE PESÉE N° 1 — À COMPLÉTER',
+     waitingSecond: 'En attente de la 2e pesée',
+     manualLegend: 'M = pesée manuelle',
+@@ -119,6 +122,7 @@ const LABELS: Record<Lang, Labels> = {
+     station: 'المحطة',
+     outside: 'خارجي',
+     cancelled: 'تذكرة ملغاة',
++    retour: 'مرتجع',
+     primaryTitle: 'تذكرة الوزن رقم 1 — غير مكتملة',
+     waitingSecond: 'في انتظار الوزن الثاني',
+     manualLegend: 'M = وزن يدوي',
+@@ -184,6 +188,11 @@ export function buildTicketHtml(
+           `${kg(op.ecart)} kg${op.ecartOk == null ? '' : op.ecartOk ? ` — ${t.ok}` : ` — ${t.out}`}`
+         )
+ 
++  // Seuls les lieux que ce type de ticket demande à l'opérateur sont imprimés :
++  // une sortie ne mentionne ni origine ni destination, une entrée seulement l'arrivée.
++  const fields = locationFieldsFor(op.type, op.isRetour)
++  const title = op.isRetour ? `${t.types[op.type]} — ${t.retour}` : t.types[op.type]
++
+   const cancelled =
+     op.status === 'ANNULEE' ? `<h2 class="cancelled">${escapeHtml(t.cancelled)}</h2>` : ''
+ 
+@@ -243,7 +252,7 @@ export function buildTicketHtml(
+ </head>
+ <body>
+   <h1>${escapeHtml(opts.company)}</h1>
+-  <h2>${escapeHtml(t.types[op.type])}</h2>
++  <h2>${escapeHtml(title)}</h2>
+   <div class="no">${escapeHtml(op.ticketNo)}</div>
+   ${isPrimary ? `<h2 class="primary">${escapeHtml(t.primaryTitle)}</h2>` : ''}
+   ${cancelled}
+@@ -253,8 +262,8 @@ export function buildTicketHtml(
+   ${linesBlock}
+   ${row(t.partner, op.partnerName)}
+   ${row(t.bl, op.blNo)}
+-  ${row(t.from, place(op.locationFromId))}
+-  ${row(t.to, place(op.locationToId))}
++  ${asksFrom(fields) ? row(t.from, place(op.locationFromId)) : ''}
++  ${asksTo(fields) ? row(t.to, place(op.locationToId)) : ''}
+   ${weighing(op.first, 1)}
+   ${weighing(op.second, 2)}
+   ${totals}
+diff --git a/src/renderer/src/components/LocationPickers.tsx b/src/renderer/src/components/LocationPickers.tsx
+new file mode 100644
+index 0000000..ca2fe98
+--- /dev/null
++++ b/src/renderer/src/components/LocationPickers.tsx
+@@ -0,0 +1,87 @@
++import type { Location } from '@shared/channels'
++import {
++  asksFrom,
++  asksTo,
++  CENTRAL_LOCATION_CODE,
++  locationFieldsFor
++} from '@shared/domain/locations'
++import type { OperationType } from '@shared/types'
++import { useI18n } from '../i18n'
++
++/**
++ * Les lieux à renseigner pour un ticket, selon son type (voir `locationFieldsFor`).
++ *
++ * Une sortie n'en demande aucun ; une entrée seulement l'emplacement de dépose.
++ * Quand le lieu est obligatoire, il n'y a pas d'option « extérieur » et le stock
++ * central est présélectionné : l'opérateur n'a rien à faire dans le cas courant.
++ * Une valeur vide ('') est envoyée telle quelle : le serveur la ramène au stock
++ * central, c'est ce que la présélection affiche.
++ */
++export default function LocationPickers({
++  type,
++  isRetour,
++  locations,
++  from,
++  to,
++  onFrom,
++  onTo,
++  disabled = false
++}: {
++  type: OperationType
++  isRetour: boolean
++  locations: Location[]
++  from: string
++  to: string
++  onFrom: (value: string) => void
++  onTo: (value: string) => void
++  disabled?: boolean
++}) {
++  const { t, lang } = useI18n()
++  const fields = locationFieldsFor(type, isRetour)
++  if (fields === 'none') return null
++
++  // Entrée ou retour de sortie : le lieu est imposé (jamais « extérieur »).
++  const required = fields !== 'both'
++  const central = locations.find((l) => l.code === CENTRAL_LOCATION_CODE)
++  const centralId = central ? String(central.id) : ''
++
++  const options = (
++    <>
++      {!required && <option value="">{t('station.outside')}</option>}
++      {locations.map((l) => (
++        <option key={l.id} value={l.id}>
++          {lang === 'ar' && l.nameAr ? l.nameAr : l.name}
++        </option>
++      ))}
++    </>
++  )
++
++  return (
++    <div className="pair">
++      {asksFrom(fields) && (
++        <label>
++          {t('station.locationFrom')}
++          <select
++            disabled={disabled}
++            value={from || (required ? centralId : '')}
++            onChange={(e) => onFrom(e.target.value)}
++          >
++            {options}
++          </select>
++        </label>
++      )}
++      {asksTo(fields) && (
++        <label>
++          {t(fields === 'to' ? 'station.locationDrop' : 'station.locationTo')}
++          <select
++            disabled={disabled}
++            value={to || (required ? centralId : '')}
++            onChange={(e) => onTo(e.target.value)}
++          >
++            {options}
++          </select>
++        </label>
++      )}
++    </div>
++  )
++}
+diff --git a/src/renderer/src/components/RetourToggle.tsx b/src/renderer/src/components/RetourToggle.tsx
+new file mode 100644
+index 0000000..85f4a15
+--- /dev/null
++++ b/src/renderer/src/components/RetourToggle.tsx
+@@ -0,0 +1,42 @@
++import type { OperationType } from '@shared/types'
++import { useI18n } from '../i18n'
++
++/** Seuls l'entrée et la sortie ont un cas « retour ». */
++export const canBeRetour = (type: OperationType): boolean => type === 'ENTREE' || type === 'SORTIE'
++
++/**
++ * Case « Retour » : marchandise vendue qui revient (entrée) ou marchandise
++ * renvoyée, par exemple un CMV au fournisseur (sortie). Le texte change avec le
++ * type pour que l'opérateur sache de quel retour il s'agit.
++ */
++export default function RetourToggle({
++  type,
++  checked,
++  onChange,
++  disabled = false
++}: {
++  type: OperationType
++  checked: boolean
++  onChange: (value: boolean) => void
++  disabled?: boolean
++}) {
++  const { t } = useI18n()
++  if (!canBeRetour(type)) return null
++
++  return (
++    <div className="checks">
++      <label className="inline">
++        <input
++          type="checkbox"
++          checked={checked}
++          disabled={disabled}
++          onChange={(e) => onChange(e.target.checked)}
++        />
++        <strong>{t('station.retour')}</strong>
++        <span className="muted">
++          — {t(`station.retour.${type === 'ENTREE' ? 'ENTREE' : 'SORTIE'}`)}
++        </span>
++      </label>
++    </div>
++  )
++}
+diff --git a/src/renderer/src/i18n.tsx b/src/renderer/src/i18n.tsx
+index c9e91be..baee8fb 100644
+--- a/src/renderer/src/i18n.tsx
++++ b/src/renderer/src/i18n.tsx
+@@ -95,6 +95,10 @@ const fr = {
+   'station.locationTo': 'Lieu d’arrivée',
+   'station.notes': 'Remarques',
+   'station.outside': 'Extérieur à la société',
++  'station.locationDrop': 'Emplacement de dépose',
++  'station.retour': 'Retour',
++  'station.retour.ENTREE': 'Retour : marchandise vendue qui revient d’un client',
++  'station.retour.SORTIE': 'Retour : marchandise renvoyée (ex. CMV au fournisseur)',
+   'station.firstWeigh': '1re pesée',
+   'station.secondWeigh': '2e pesée',
+   'station.capture': 'Capturer',
+@@ -287,6 +291,10 @@ const ar: Record<TKey, string> = {
+   'station.locationTo': 'مكان الوصول',
+   'station.notes': 'ملاحظات',
+   'station.outside': 'خارج الشركة',
++  'station.locationDrop': 'مكان التفريغ',
++  'station.retour': 'مرتجع',
++  'station.retour.ENTREE': 'مرتجع: بضاعة مباعة عادت من زبون',
++  'station.retour.SORTIE': 'مرتجع: بضاعة أُعيدت (مثل CMV إلى المورد)',
+   'station.firstWeigh': 'الوزن الأول',
+   'station.secondWeigh': 'الوزن الثاني',
+   'station.capture': 'تسجيل',
+diff --git a/src/renderer/src/pages/Balance1.tsx b/src/renderer/src/pages/Balance1.tsx
+index ee39370..b8f7697 100644
+--- a/src/renderer/src/pages/Balance1.tsx
++++ b/src/renderer/src/pages/Balance1.tsx
+@@ -6,6 +6,7 @@ import { api, call, errorMessage, formatDateTime, formatKg } from '../api'
+ import CaptureBox, { type CaptureRequest } from '../components/CaptureBox'
+ import ManualMark from '../components/ManualMark'
+ import ProductLines, { cleanLines, hasIncompleteLine } from '../components/ProductLines'
++import RetourToggle from '../components/RetourToggle'
+ import SimulatorPanel from '../components/SimulatorPanel'
+ import TicketPreview from '../components/TicketPreview'
+ import WeightReadout from '../components/WeightReadout'
+@@ -31,6 +32,7 @@ export default function Balance1({ type }: { type: OperationType }) {
+   const [plate, setPlate] = useState('')
+   const [driverName, setDriverName] = useState('')
+   const [notes, setNotes] = useState('')
++  const [isRetour, setIsRetour] = useState(false)
+   const [lines, setLines] = useState<ProductLine[]>(() => blankLines(type))
+   const [ticket, setTicket] = useState<Operation | null>(null)
+   // Camion repassé sur la balance : la 1re pesée du ticket existant est à refaire.
+@@ -66,6 +68,7 @@ export default function Balance1({ type }: { type: OperationType }) {
+           current = await call(
+             api.ops.create({
+               type,
++              isRetour,
+               plate: plate || null,
+               driverName: driverName || null,
+               notes: notes || null,
+@@ -92,7 +95,7 @@ export default function Balance1({ type }: { type: OperationType }) {
+         setBusy(false)
+       }
+     },
+-    [type, plate, driverName, notes, lines, knowsProduct, redo, stale, t]
++    [type, isRetour, plate, driverName, notes, lines, knowsProduct, redo, stale, t]
+   )
+ 
+   const balance = useBalance(setError)
+@@ -113,6 +116,7 @@ export default function Balance1({ type }: { type: OperationType }) {
+     setPlate('')
+     setDriverName('')
+     setNotes('')
++    setIsRetour(false)
+     setLines(blankLines(type))
+     setError(null)
+   }
+@@ -264,6 +268,8 @@ export default function Balance1({ type }: { type: OperationType }) {
+               <input value={driverName} onChange={(e) => setDriverName(e.target.value)} />
+             </label>
+ 
++            <RetourToggle type={type} checked={isRetour} onChange={setIsRetour} disabled={busy} />
++
+             {knowsProduct ? (
+               <ProductLines lines={lines} onChange={setLines} disabled={busy} />
+             ) : (
+@@ -284,6 +290,7 @@ export default function Balance1({ type }: { type: OperationType }) {
+         <div className="card form-card">
+           <div className="ticket-head">
+             <span className="badge">{t('ops.primary')}</span>
++            {ticket.isRetour && <span className="badge warn">{t('station.retour')}</span>}
+             <strong>{ticket.ticketNo}</strong>
+           </div>
+ 
+diff --git a/src/renderer/src/pages/Balance2.tsx b/src/renderer/src/pages/Balance2.tsx
+index 8972920..13b5a62 100644
+--- a/src/renderer/src/pages/Balance2.tsx
++++ b/src/renderer/src/pages/Balance2.tsx
+@@ -1,12 +1,15 @@
+ import { useCallback, useEffect, useRef, useState } from 'react'
+ import type { Location, OpUpdate } from '@shared/channels'
++import { asksFrom, asksTo, locationFieldsFor } from '@shared/domain/locations'
+ import { ticketMatchesQuery } from '@shared/domain/plate'
+ import { isManualKind } from '@shared/domain/weighing'
+ import type { Operation, OperationType, ProductLine, WeightSample } from '@shared/types'
+ import { api, call, errorMessage, formatDateTime, formatKg } from '../api'
+ import CaptureBox, { type CaptureRequest } from '../components/CaptureBox'
++import LocationPickers from '../components/LocationPickers'
+ import ManualMark from '../components/ManualMark'
+ import ProductLines, { cleanLines, hasIncompleteLine } from '../components/ProductLines'
++import RetourToggle from '../components/RetourToggle'
+ import SimulatorPanel from '../components/SimulatorPanel'
+ import TicketPreview from '../components/TicketPreview'
+ import WeightReadout from '../components/WeightReadout'
+@@ -14,6 +17,7 @@ import { useBalance } from '../hooks/useBalance'
+ import { useI18n } from '../i18n'
+ 
+ interface CompleteForm {
++  isRetour: boolean
+   partnerName: string
+   blNo: string
+   locationFromId: string
+@@ -21,18 +25,30 @@ interface CompleteForm {
+   notes: string
+ }
+ 
+-/** Champs descriptifs saisis à l'écran, au format de `ops.update`. */
+-function infoPatch(form: CompleteForm): OpUpdate {
+-  return {
++/**
++ * Champs descriptifs saisis à l'écran, au format de `ops.update`.
++ * Seuls les lieux que ce type de ticket demande sont envoyés : le serveur fixe
++ * les autres (une sortie part du stock central vers l'extérieur).
++ */
++function infoPatch(form: CompleteForm, type: OperationType): OpUpdate {
++  const fields = locationFieldsFor(type, form.isRetour)
++  const patch: OpUpdate = {
++    isRetour: form.isRetour,
+     partnerName: form.partnerName || null,
+     blNo: form.blNo || null,
+-    locationFromId: form.locationFromId === '' ? null : Number(form.locationFromId),
+-    locationToId: form.locationToId === '' ? null : Number(form.locationToId),
+     notes: form.notes || null
+   }
++  if (asksFrom(fields)) {
++    patch.locationFromId = form.locationFromId === '' ? null : Number(form.locationFromId)
++  }
++  if (asksTo(fields)) {
++    patch.locationToId = form.locationToId === '' ? null : Number(form.locationToId)
++  }
++  return patch
+ }
+ 
+ const EMPTY_FORM: CompleteForm = {
++  isRetour: false,
+   partnerName: '',
+   blNo: '',
+   locationFromId: '',
+@@ -101,7 +117,7 @@ export default function Balance2({ type }: { type: OperationType }) {
+       try {
+         // Les informations saisies partent avec la pesée : pas d'étape
+         // « enregistrer » à oublier avant de peser.
+-        await call(api.ops.update(current.id, infoPatch(form)))
++        await call(api.ops.update(current.id, infoPatch(form, type)))
+         const updated = await call(
+           api.ops.capture({
+             operationId: current.id,
+@@ -120,7 +136,7 @@ export default function Balance2({ type }: { type: OperationType }) {
+         setBusy(false)
+       }
+     },
+-    [lines, form, t]
++    [lines, form, type, t]
+   )
+ 
+   /** La 1re pesée est refaite : nouveau poids ; l'ancienne reste tracée côté base. */
+@@ -177,6 +193,7 @@ export default function Balance2({ type }: { type: OperationType }) {
+     ticketRef.current = op
+     setSelected(op)
+     setForm({
++      isRetour: op.isRetour,
+       partnerName: op.partnerName ?? '',
+       blNo: op.blNo ?? '',
+       locationFromId: op.locationFromId == null ? '' : String(op.locationFromId),
+@@ -254,17 +271,6 @@ export default function Balance2({ type }: { type: OperationType }) {
+   const closed = selected != null && selected.status !== 'OUVERTE'
+   const incomplete = hasIncompleteLine(lines)
+ 
+-  const locationOptions = (
+-    <>
+-      <option value="">{t('station.outside')}</option>
+-      {locations.map((l) => (
+-        <option key={l.id} value={l.id}>
+-          {lang === 'ar' && l.nameAr ? l.nameAr : l.name}
+-        </option>
+-      ))}
+-    </>
+-  )
+-
+   const filtered = pending.filter((op) => ticketMatchesQuery(op, query))
+ 
+   return (
+@@ -299,6 +305,7 @@ export default function Balance2({ type }: { type: OperationType }) {
+                 <tr key={op.id}>
+                   <td>
+                     <strong>{op.ticketNo}</strong>
++                    {op.isRetour && <span className="badge warn">{t('station.retour')}</span>}
+                   </td>
+                   <td>{formatDateTime(op.createdAt)}</td>
+                   <td>{op.plate || '—'}</td>
+@@ -340,6 +347,7 @@ export default function Balance2({ type }: { type: OperationType }) {
+               <span className={`badge${closed ? ' ok' : ''}`}>
+                 {closed ? t('ops.final') : t('ops.primary')}
+               </span>
++              {selected.isRetour && <span className="badge warn">{t('station.retour')}</span>}
+               <strong>{selected.ticketNo}</strong>
+               {!complete && (
+                 <div className="head-actions">
+@@ -398,26 +406,22 @@ export default function Balance2({ type }: { type: OperationType }) {
+                     />
+                   </label>
+                 </div>
+-                <div className="pair">
+-                  <label>
+-                    {t('station.locationFrom')}
+-                    <select
+-                      value={form.locationFromId}
+-                      onChange={(e) => setForm({ ...form, locationFromId: e.target.value })}
+-                    >
+-                      {locationOptions}
+-                    </select>
+-                  </label>
+-                  <label>
+-                    {t('station.locationTo')}
+-                    <select
+-                      value={form.locationToId}
+-                      onChange={(e) => setForm({ ...form, locationToId: e.target.value })}
+-                    >
+-                      {locationOptions}
+-                    </select>
+-                  </label>
+-                </div>
++                <RetourToggle
++                  type={type}
++                  checked={form.isRetour}
++                  onChange={(value) => setForm({ ...form, isRetour: value })}
++                  disabled={busy}
++                />
++                <LocationPickers
++                  type={type}
++                  isRetour={form.isRetour}
++                  locations={locations}
++                  from={form.locationFromId}
++                  to={form.locationToId}
++                  onFrom={(value) => setForm({ ...form, locationFromId: value })}
++                  onTo={(value) => setForm({ ...form, locationToId: value })}
++                  disabled={busy}
++                />
+                 <label>
+                   {t('station.notes')}
+                   <textarea
+diff --git a/src/renderer/src/pages/Operations.tsx b/src/renderer/src/pages/Operations.tsx
+index 64a8719..9d57bd2 100644
+--- a/src/renderer/src/pages/Operations.tsx
++++ b/src/renderer/src/pages/Operations.tsx
+@@ -1,11 +1,15 @@
+ import { useCallback, useEffect, useState } from 'react'
+ import type { Location, OpUpdate } from '@shared/channels'
++import { asksFrom, asksTo, locationFieldsFor } from '@shared/domain/locations'
+ import type { Operation, OperationStatus, OperationType } from '@shared/types'
+ import { api, call, errorMessage, formatDateTime, formatKg } from '../api'
++import LocationPickers from '../components/LocationPickers'
++import RetourToggle from '../components/RetourToggle'
+ import TicketPreview from '../components/TicketPreview'
+ import { useI18n } from '../i18n'
+ 
+ interface EditDraft {
++  isRetour: boolean
+   plate: string
+   driverName: string
+   partnerName: string
+@@ -18,6 +22,7 @@ interface EditDraft {
+ 
+ function toDraft(op: Operation): EditDraft {
+   return {
++    isRetour: op.isRetour,
+     plate: op.plate ?? '',
+     driverName: op.driverName ?? '',
+     partnerName: op.partnerName ?? '',
+@@ -107,15 +112,22 @@ export default function Operations({ type }: { type: OperationType }) {
+     setBusy(true)
+     try {
+       const patch: OpUpdate = {
++        isRetour: draft.isRetour,
+         plate: draft.plate || null,
+         driverName: draft.driverName || null,
+         partnerName: draft.partnerName || null,
+         blNo: draft.blNo || null,
+         blDate: draft.blDate || null,
+-        locationFromId: draft.locationFromId === '' ? null : Number(draft.locationFromId),
+-        locationToId: draft.locationToId === '' ? null : Number(draft.locationToId),
+         notes: draft.notes || null
+       }
++      // Seuls les lieux demandés pour ce type sont envoyés (le serveur fixe les autres).
++      const fields = locationFieldsFor(type, draft.isRetour)
++      if (asksFrom(fields)) {
++        patch.locationFromId = draft.locationFromId === '' ? null : Number(draft.locationFromId)
++      }
++      if (asksTo(fields)) {
++        patch.locationToId = draft.locationToId === '' ? null : Number(draft.locationToId)
++      }
+       await call(api.ops.update(id, patch))
+       setEditingId(null)
+       setDraft(null)
+@@ -150,23 +162,12 @@ export default function Operations({ type }: { type: OperationType }) {
+     }
+   }
+ 
+-  const editField = (key: keyof EditDraft) => ({
++  const editField = (key: Exclude<keyof EditDraft, 'isRetour'>) => ({
+     value: draft?.[key] ?? '',
+     onChange: (e: { target: { value: string } }) =>
+       setDraft((current) => (current ? { ...current, [key]: e.target.value } : current))
+   })
+ 
+-  const locationOptions = (
+-    <>
+-      <option value="">{t('station.outside')}</option>
+-      {locations.map((l) => (
+-        <option key={l.id} value={l.id}>
+-          {lang === 'ar' && l.nameAr ? l.nameAr : l.name}
+-        </option>
+-      ))}
+-    </>
+-  )
+-
+   return (
+     <div className="card">
+       <h2>{`${t('ops.title')} — ${t(`station.type.${type}`)}`}</h2>
+@@ -230,15 +231,31 @@ export default function Operations({ type }: { type: OperationType }) {
+                       {t('station.blNo')}
+                       <input {...editField('blNo')} />
+                     </label>
+-                    <label>
+-                      {t('station.locationFrom')}
+-                      <select {...editField('locationFromId')}>{locationOptions}</select>
+-                    </label>
+-                    <label>
+-                      {t('station.locationTo')}
+-                      <select {...editField('locationToId')}>{locationOptions}</select>
+-                    </label>
+                   </div>
++                  <RetourToggle
++                    type={type}
++                    checked={draft?.isRetour ?? false}
++                    onChange={(value) =>
++                      setDraft((current) => (current ? { ...current, isRetour: value } : current))
++                    }
++                  />
++                  <LocationPickers
++                    type={type}
++                    isRetour={draft?.isRetour ?? false}
++                    locations={locations}
++                    from={draft?.locationFromId ?? ''}
++                    to={draft?.locationToId ?? ''}
++                    onFrom={(value) =>
++                      setDraft((current) =>
++                        current ? { ...current, locationFromId: value } : current
++                      )
++                    }
++                    onTo={(value) =>
++                      setDraft((current) =>
++                        current ? { ...current, locationToId: value } : current
++                      )
++                    }
++                  />
+                   <label>
+                     {t('station.notes')}
+                     <textarea rows={2} {...editField('notes')} />
+@@ -269,6 +286,7 @@ export default function Operations({ type }: { type: OperationType }) {
+               <tr key={row.id} className={row.status === 'ANNULEE' ? 'cancelled' : undefined}>
+                 <td>
+                   <strong>{row.ticketNo}</strong>
++                  {row.isRetour && <span className="badge warn">{t('station.retour')}</span>}
+                   <br />
+                   <small className="muted">{t(`ops.status.${row.status}`)}</small>
+                   {row.status !== 'ANNULEE' && (
+@@ -356,7 +374,11 @@ export default function Operations({ type }: { type: OperationType }) {
+                         >
+                           {t('common.confirm')}
+                         </button>
+-                        <button type="button" className="ghost" onClick={() => setCancellingId(null)}>
++                        <button
++                          type="button"
++                          className="ghost"
++                          onClick={() => setCancellingId(null)}
++                        >
+                           {t('common.cancel')}
+                         </button>
+                       </>
+diff --git a/src/renderer/src/styles.css b/src/renderer/src/styles.css
+index 8d2d21f..d65a1bd 100644
+--- a/src/renderer/src/styles.css
++++ b/src/renderer/src/styles.css
+@@ -783,13 +783,13 @@ tr.cancelled {
+   margin-inline-start: auto;
+ }
+ 
+-.form-col .pair {
++.pair {
+   display: grid;
+   grid-template-columns: 1fr 1fr;
+   gap: 12px;
+ }
+ 
+-.form-col .pair label {
++.pair label {
+   min-width: 0;
+ }
+ 
+diff --git a/src/shared/channels.ts b/src/shared/channels.ts
+index 9d0c060..a01983e 100644
+--- a/src/shared/channels.ts
++++ b/src/shared/channels.ts
+@@ -124,6 +124,7 @@ export interface CancelInput {
+  * passent par `setLines`, qui remplace la liste entière.
+  */
+ export interface OpUpdate {
++  isRetour?: boolean
+   plate?: string | null
+   driverName?: string | null
+   partnerName?: string | null
+diff --git a/src/shared/domain/locations.test.ts b/src/shared/domain/locations.test.ts
+new file mode 100644
+index 0000000..4d78f68
+--- /dev/null
++++ b/src/shared/domain/locations.test.ts
+@@ -0,0 +1,83 @@
++import { describe, expect, it } from 'vitest'
++import { asksFrom, asksTo, locationFieldsFor, resolveLocations } from './locations'
++
++const CENTRAL = 1
++const UNIT_A = 2
++
++describe('locationFieldsFor', () => {
++  it("ENTREE ne demande que l'arrivée, retour ou non", () => {
++    expect(locationFieldsFor('ENTREE', false)).toBe('to')
++    expect(locationFieldsFor('ENTREE', true)).toBe('to')
++  })
++
++  it('SORTIE ne demande rien, sauf un retour qui demande le départ', () => {
++    expect(locationFieldsFor('SORTIE', false)).toBe('none')
++    expect(locationFieldsFor('SORTIE', true)).toBe('from')
++  })
++
++  it('TRANSFERT et TIERS gardent les deux lieux', () => {
++    expect(locationFieldsFor('TRANSFERT', false)).toBe('both')
++    expect(locationFieldsFor('TIERS', false)).toBe('both')
++  })
++
++  it('asksFrom / asksTo suivent le champ', () => {
++    expect([asksFrom('none'), asksTo('none')]).toEqual([false, false])
++    expect([asksFrom('from'), asksTo('from')]).toEqual([true, false])
++    expect([asksFrom('to'), asksTo('to')]).toEqual([false, true])
++    expect([asksFrom('both'), asksTo('both')]).toEqual([true, true])
++  })
++})
++
++describe('resolveLocations', () => {
++  const base = { isRetour: false, fromId: null, toId: null, centralId: CENTRAL }
++
++  it("ENTREE : arrivée choisie conservée, départ toujours vide (l'extérieur)", () => {
++    expect(resolveLocations({ ...base, type: 'ENTREE', fromId: 9, toId: UNIT_A })).toEqual({
++      fromId: null,
++      toId: UNIT_A
++    })
++  })
++
++  it('ENTREE sans arrivée : stock central', () => {
++    expect(resolveLocations({ ...base, type: 'ENTREE' })).toEqual({ fromId: null, toId: CENTRAL })
++  })
++
++  it('ENTREE retour (vente reprise) : même règle que l’entrée', () => {
++    expect(resolveLocations({ ...base, type: 'ENTREE', isRetour: true, toId: UNIT_A })).toEqual({
++      fromId: null,
++      toId: UNIT_A
++    })
++  })
++
++  it('SORTIE : sort du stock central vers l’extérieur, quoi que le client envoie', () => {
++    expect(resolveLocations({ ...base, type: 'SORTIE', fromId: UNIT_A, toId: 7 })).toEqual({
++      fromId: CENTRAL,
++      toId: null
++    })
++  })
++
++  it('SORTIE retour : sort du lieu choisi, central par défaut', () => {
++    expect(resolveLocations({ ...base, type: 'SORTIE', isRetour: true, fromId: UNIT_A })).toEqual({
++      fromId: UNIT_A,
++      toId: null
++    })
++    expect(resolveLocations({ ...base, type: 'SORTIE', isRetour: true })).toEqual({
++      fromId: CENTRAL,
++      toId: null
++    })
++  })
++
++  it('TRANSFERT et TIERS : rien n’est modifié', () => {
++    expect(resolveLocations({ ...base, type: 'TRANSFERT', fromId: 2, toId: 3 })).toEqual({
++      fromId: 2,
++      toId: 3
++    })
++    expect(resolveLocations({ ...base, type: 'TIERS' })).toEqual({ fromId: null, toId: null })
++  })
++
++  it("sans stock central dans le référentiel, n'invente aucun lieu", () => {
++    const noCentral = { ...base, centralId: null }
++    expect(resolveLocations({ ...noCentral, type: 'ENTREE' })).toEqual({ fromId: null, toId: null })
++    expect(resolveLocations({ ...noCentral, type: 'SORTIE' })).toEqual({ fromId: null, toId: null })
++  })
++})
+diff --git a/src/shared/domain/locations.ts b/src/shared/domain/locations.ts
+new file mode 100644
+index 0000000..3f36925
+--- /dev/null
++++ b/src/shared/domain/locations.ts
+@@ -0,0 +1,58 @@
++import type { OperationType } from '../types'
++
++/** Code du lieu « Stock central » dans le référentiel de départ (migration 001). */
++export const CENTRAL_LOCATION_CODE = 'STOCK'
++
++/**
++ * Quels lieux l'opérateur doit renseigner pour un ticket.
++ *
++ *  - ENTREE    : seulement le lieu d'arrivée (stock central, unité A, unité B…).
++ *                La marchandise vient de l'extérieur, y compris un retour client.
++ *  - SORTIE    : aucun lieu. La marchandise de la société part à l'extérieur.
++ *                Un RETOUR (marchandise renvoyée, ex. un CMV au fournisseur) sort
++ *                d'un lieu précis de la société : le lieu de départ est demandé.
++ *  - TRANSFERT / TIERS : inchangés, les deux lieux restent libres.
++ */
++export type LocationFields = 'none' | 'from' | 'to' | 'both'
++
++export function locationFieldsFor(type: OperationType, isRetour: boolean): LocationFields {
++  switch (type) {
++    case 'ENTREE':
++      return 'to'
++    case 'SORTIE':
++      return isRetour ? 'from' : 'none'
++    default:
++      return 'both'
++  }
++}
++
++/** Le lieu de départ est-il à saisir pour ce ticket ? */
++export const asksFrom = (fields: LocationFields): boolean => fields === 'from' || fields === 'both'
++
++/** Le lieu d'arrivée est-il à saisir pour ce ticket ? */
++export const asksTo = (fields: LocationFields): boolean => fields === 'to' || fields === 'both'
++
++/**
++ * Lieux enregistrés en base. Ce qui n'est pas demandé à l'opérateur est imposé
++ * ici, pour que le stock (qui se déduit de ces deux colonnes) reste juste :
++ *  - un lieu demandé mais laissé vide retombe sur le stock central ;
++ *  - un lieu non demandé est vidé (extérieur), ou fixé au stock central quand
++ *    c'est la société qui fournit la marchandise (SORTIE).
++ *
++ * `centralId` = null si le référentiel n'a pas de « STOCK » : rien n'est inventé.
++ */
++export function resolveLocations(input: {
++  type: OperationType
++  isRetour: boolean
++  fromId: number | null
++  toId: number | null
++  centralId: number | null
++}): { fromId: number | null; toId: number | null } {
++  const { type, isRetour, fromId, toId, centralId } = input
++  const fields = locationFieldsFor(type, isRetour)
++  if (fields === 'both') return { fromId, toId }
++
++  if (type === 'ENTREE') return { fromId: null, toId: toId ?? centralId }
++  // SORTIE : la marchandise quitte la société.
++  return { fromId: fields === 'from' ? (fromId ?? centralId) : centralId, toId: null }
++}
+diff --git a/src/shared/schemas.ts b/src/shared/schemas.ts
+index 77bfccc..e74dbb2 100644
+--- a/src/shared/schemas.ts
++++ b/src/shared/schemas.ts
+@@ -49,6 +49,7 @@ export const productLineSchema = z.object({
+ 
+ export const ticketDraftSchema = z.object({
+   type: z.enum(OPERATION_TYPES),
++  isRetour: z.boolean().optional(),
+   plate: z.string().trim().max(32).nullish(),
+   driverName: z.string().trim().max(128).nullish(),
+   partnerId: z.number().int().positive().nullish(),
+@@ -101,6 +102,7 @@ export const opCloseSchema = z.object({
+ export const opUpdateSchema = z.object({
+   id: z.number().int().positive(),
+   patch: z.object({
++    isRetour: z.boolean().optional(),
+     plate: z.string().trim().max(32).nullish(),
+     driverName: z.string().trim().max(128).nullish(),
+     partnerName: z.string().trim().max(160).nullish(),
+diff --git a/src/shared/types.ts b/src/shared/types.ts
+index 41be453..9edb989 100644
+--- a/src/shared/types.ts
++++ b/src/shared/types.ts
+@@ -29,6 +29,11 @@ export interface ProductLine {
+ /** Ce qu'un opérateur remplit avant la première pesée. */
+ export interface TicketDraft {
+   type: OperationType
++  /**
++   * Retour : marchandise vendue qui revient (ENTREE) ou marchandise renvoyée au
++   * fournisseur (SORTIE). Le stock bouge dans le même sens que sans le drapeau.
++   */
++  isRetour?: boolean
+   plate?: string | null
+   driverName?: string | null
+   partnerId?: number | null
+@@ -56,6 +61,7 @@ export interface Operation extends TicketDraft {
+   id: number
+   ticketNo: string
+   status: OperationStatus
++  isRetour: boolean
+   first: Weighing | null
+   second: Weighing | null
+   /** Somme des lignes, figée à la 2e pesée. */
+-- 
+2.43.0
+
+
+From fd74f0fa6bfee5ae581ba3e1e1072f870dc6a25d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 20:45:15 +0100
+Subject: [PATCH 2/2] Filtre par date sur les tickets et la 2e balance
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- OpFilter : dateFrom / dateTo (jours inclus, sur la date de création)
+- Composant DateRangeFilter dans la page Tickets et la liste d'attente de la 2e balance
+- Test d'intégration du filtre
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016BJ1sCkcEcDNZYYUKRi2LY
+---
+ src/main/db/operations.integration.test.ts    | 15 ++++++
+ src/main/db/operations.ts                     |  9 ++++
+ .../src/components/DateRangeFilter.tsx        | 53 +++++++++++++++++++
+ src/renderer/src/i18n.tsx                     |  6 +++
+ src/renderer/src/pages/Balance2.tsx           | 18 ++++++-
+ src/renderer/src/pages/Operations.tsx         |  8 ++-
+ src/shared/channels.ts                        |  3 ++
+ src/shared/schemas.ts                         | 10 +++-
+ 8 files changed, 118 insertions(+), 4 deletions(-)
+ create mode 100644 src/renderer/src/components/DateRangeFilter.tsx
+
+diff --git a/src/main/db/operations.integration.test.ts b/src/main/db/operations.integration.test.ts
+index e32d1d1..847d302 100644
+--- a/src/main/db/operations.integration.test.ts
++++ b/src/main/db/operations.integration.test.ts
+@@ -513,4 +513,19 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
+       expect(Number(moves[1]?.qty_out)).toBe(500)
+     })
+   })
++  it('filtre les tickets par date de création, jours inclus', async () => {
++    const ticket = await operations.create({ type: 'TIERS', plate: 'DATE-FILTER-1' }, user)
++    await pool
++      .getPool()
++      .query("UPDATE operations SET created_at = '2020-03-15 23:30:00' WHERE id = ?", [ticket.id])
++
++    const ids = async (dateFrom?: string, dateTo?: string): Promise<number[]> =>
++      (await operations.list({ search: 'DATE-FILTER-1', dateFrom, dateTo })).map((o) => o.id)
++
++    expect(await ids()).toEqual([ticket.id])
++    expect(await ids('2020-03-15', '2020-03-15')).toEqual([ticket.id]) // tard le dernier jour : inclus
++    expect(await ids('2020-03-16')).toEqual([])
++    expect(await ids(undefined, '2020-03-14')).toEqual([])
++    expect(await ids('2020-03-01', '2020-03-31')).toEqual([ticket.id])
++  })
+ })
+diff --git a/src/main/db/operations.ts b/src/main/db/operations.ts
+index 8da4e99..7a9ec4f 100644
+--- a/src/main/db/operations.ts
++++ b/src/main/db/operations.ts
+@@ -549,6 +549,15 @@ export async function list(filter: OpFilter): Promise<Operation[]> {
+     where.push('o.status = ?')
+     params.push(filter.status)
+   }
++  // Jours inclus : de 00:00 du premier jour jusqu'à la fin du dernier.
++  if (filter.dateFrom) {
++    where.push('o.created_at >= ?')
++    params.push(`${filter.dateFrom} 00:00:00`)
++  }
++  if (filter.dateTo) {
++    where.push('o.created_at < DATE_ADD(?, INTERVAL 1 DAY)')
++    params.push(filter.dateTo)
++  }
+   if (filter.search) {
+     where.push(
+       `(o.ticket_no LIKE ? OR o.plate LIKE ? OR o.bl_no LIKE ? OR o.partner_name LIKE ?
+diff --git a/src/renderer/src/components/DateRangeFilter.tsx b/src/renderer/src/components/DateRangeFilter.tsx
+new file mode 100644
+index 0000000..ea584e4
+--- /dev/null
++++ b/src/renderer/src/components/DateRangeFilter.tsx
+@@ -0,0 +1,53 @@
++import { useI18n } from '../i18n'
++
++/**
++ * Filtre par date de création du ticket : « du … au … » (jours inclus).
++ * Les valeurs sont des dates locales `YYYY-MM-DD` ; une valeur vide = pas de borne.
++ */
++export default function DateRangeFilter({
++  from,
++  to,
++  onFrom,
++  onTo
++}: {
++  from: string
++  to: string
++  onFrom: (value: string) => void
++  onTo: (value: string) => void
++}) {
++  const { t } = useI18n()
++  return (
++    <>
++      <label className="inline">
++        {t('filter.from')}
++        <input
++          type="date"
++          value={from}
++          max={to || undefined}
++          onChange={(e) => onFrom(e.target.value)}
++        />
++      </label>
++      <label className="inline">
++        {t('filter.to')}
++        <input
++          type="date"
++          value={to}
++          min={from || undefined}
++          onChange={(e) => onTo(e.target.value)}
++        />
++      </label>
++      {(from !== '' || to !== '') && (
++        <button
++          type="button"
++          className="ghost"
++          onClick={() => {
++            onFrom('')
++            onTo('')
++          }}
++        >
++          {t('filter.clearDates')}
++        </button>
++      )}
++    </>
++  )
++}
+diff --git a/src/renderer/src/i18n.tsx b/src/renderer/src/i18n.tsx
+index baee8fb..b9ba539 100644
+--- a/src/renderer/src/i18n.tsx
++++ b/src/renderer/src/i18n.tsx
+@@ -26,6 +26,9 @@ const fr = {
+   'common.confirm': 'Confirmer',
+   'common.close': 'Fermer',
+   'common.all': 'Tous',
++  'filter.from': 'Du',
++  'filter.to': 'Au',
++  'filter.clearDates': 'Toutes les dates',
+   'common.detected': 'Ports détectés',
+   'common.optional': 'facultatif',
+   'common.required': 'champ obligatoire',
+@@ -224,6 +227,9 @@ const ar: Record<TKey, string> = {
+   'common.confirm': 'تأكيد',
+   'common.close': 'إغلاق',
+   'common.all': 'الكل',
++  'filter.from': 'من',
++  'filter.to': 'إلى',
++  'filter.clearDates': 'كل التواريخ',
+   'common.detected': 'المنافذ المكتشفة',
+   'common.optional': 'اختياري',
+   'common.required': 'حقل إلزامي',
+diff --git a/src/renderer/src/pages/Balance2.tsx b/src/renderer/src/pages/Balance2.tsx
+index 13b5a62..45c4453 100644
+--- a/src/renderer/src/pages/Balance2.tsx
++++ b/src/renderer/src/pages/Balance2.tsx
+@@ -6,6 +6,7 @@ import { isManualKind } from '@shared/domain/weighing'
+ import type { Operation, OperationType, ProductLine, WeightSample } from '@shared/types'
+ import { api, call, errorMessage, formatDateTime, formatKg } from '../api'
+ import CaptureBox, { type CaptureRequest } from '../components/CaptureBox'
++import DateRangeFilter from '../components/DateRangeFilter'
+ import LocationPickers from '../components/LocationPickers'
+ import ManualMark from '../components/ManualMark'
+ import ProductLines, { cleanLines, hasIncompleteLine } from '../components/ProductLines'
+@@ -69,6 +70,8 @@ export default function Balance2({ type }: { type: OperationType }) {
+   const [pending, setPending] = useState<Operation[]>([])
+   const [selected, setSelected] = useState<Operation | null>(null)
+   const [query, setQuery] = useState('')
++  const [dateFrom, setDateFrom] = useState('')
++  const [dateTo, setDateTo] = useState('')
+   const [form, setForm] = useState<CompleteForm>(EMPTY_FORM)
+   const [lines, setLines] = useState<ProductLine[]>([])
+   const [locations, setLocations] = useState<Location[]>([])
+@@ -83,13 +86,21 @@ export default function Balance2({ type }: { type: OperationType }) {
+ 
+   const loadPending = useCallback(async (): Promise<void> => {
+     try {
+-      const rows = await call(api.ops.list({ type, status: 'OUVERTE', limit: 200 }))
++      const rows = await call(
++        api.ops.list({
++          type,
++          status: 'OUVERTE',
++          limit: 200,
++          dateFrom: dateFrom || null,
++          dateTo: dateTo || null
++        })
++      )
+       setPending(rows.filter((r) => r.first != null && r.second == null))
+       setError(null)
+     } catch (err) {
+       setError(errorMessage(err))
+     }
+-  }, [type])
++  }, [type, dateFrom, dateTo])
+ 
+   useEffect(() => {
+     void loadPending()
+@@ -288,6 +299,9 @@ export default function Balance2({ type }: { type: OperationType }) {
+             value={query}
+             onChange={(e) => setQuery(e.target.value)}
+           />
++          <div className="row">
++            <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
++          </div>
+ 
+           <table>
+             <thead>
+diff --git a/src/renderer/src/pages/Operations.tsx b/src/renderer/src/pages/Operations.tsx
+index 9d57bd2..09849a2 100644
+--- a/src/renderer/src/pages/Operations.tsx
++++ b/src/renderer/src/pages/Operations.tsx
+@@ -3,6 +3,7 @@ import type { Location, OpUpdate } from '@shared/channels'
+ import { asksFrom, asksTo, locationFieldsFor } from '@shared/domain/locations'
+ import type { Operation, OperationStatus, OperationType } from '@shared/types'
+ import { api, call, errorMessage, formatDateTime, formatKg } from '../api'
++import DateRangeFilter from '../components/DateRangeFilter'
+ import LocationPickers from '../components/LocationPickers'
+ import RetourToggle from '../components/RetourToggle'
+ import TicketPreview from '../components/TicketPreview'
+@@ -45,6 +46,8 @@ export default function Operations({ type }: { type: OperationType }) {
+   const { t, lang } = useI18n()
+   const [status, setStatus] = useState<OperationStatus | null>(null)
+   const [search, setSearch] = useState('')
++  const [dateFrom, setDateFrom] = useState('')
++  const [dateTo, setDateTo] = useState('')
+   const [rows, setRows] = useState<Operation[]>([])
+   const [locations, setLocations] = useState<Location[]>([])
+   const [error, setError] = useState<string | null>(null)
+@@ -63,6 +66,8 @@ export default function Operations({ type }: { type: OperationType }) {
+             type,
+             status,
+             search: search.trim() === '' ? null : search.trim(),
++            dateFrom: dateFrom || null,
++            dateTo: dateTo || null,
+             limit: 200
+           })
+         )
+@@ -71,7 +76,7 @@ export default function Operations({ type }: { type: OperationType }) {
+     } catch (err) {
+       setError(errorMessage(err))
+     }
+-  }, [type, status, search])
++  }, [type, status, search, dateFrom, dateTo])
+ 
+   useEffect(() => {
+     void reload()
+@@ -187,6 +192,7 @@ export default function Operations({ type }: { type: OperationType }) {
+           value={search}
+           onChange={(e) => setSearch(e.target.value)}
+         />
++        <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
+         <button type="button" className="ghost" onClick={() => void reload()}>
+           {t('common.refresh')}
+         </button>
+diff --git a/src/shared/channels.ts b/src/shared/channels.ts
+index a01983e..7e90c79 100644
+--- a/src/shared/channels.ts
++++ b/src/shared/channels.ts
+@@ -94,6 +94,9 @@ export interface OpFilter {
+   status?: OperationStatus | null
+   limit?: number
+   search?: string | null
++  /** Jours inclus, au format `YYYY-MM-DD`, sur la date de création du ticket. */
++  dateFrom?: string | null
++  dateTo?: string | null
+ }
+ 
+ export interface CaptureInput {
+diff --git a/src/shared/schemas.ts b/src/shared/schemas.ts
+index e74dbb2..d77b9a5 100644
+--- a/src/shared/schemas.ts
++++ b/src/shared/schemas.ts
+@@ -81,7 +81,15 @@ export const opFilterSchema = z.object({
+   type: z.enum(OPERATION_TYPES).nullish(),
+   status: z.enum(['OUVERTE', 'FERMEE', 'ANNULEE']).nullish(),
+   limit: z.number().int().min(1).max(500).optional(),
+-  search: z.string().trim().max(64).nullish()
++  search: z.string().trim().max(64).nullish(),
++  dateFrom: z
++    .string()
++    .regex(/^\d{4}-\d{2}-\d{2}$/)
++    .nullish(),
++  dateTo: z
++    .string()
++    .regex(/^\d{4}-\d{2}-\d{2}$/)
++    .nullish()
+ })
+ 
+ export const loginSchema = z.object({
+-- 
+2.43.0
+

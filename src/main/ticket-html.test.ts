@@ -8,6 +8,7 @@ function ticket(over: Partial<Operation> = {}): Operation {
     ticketNo: 'E-2026-000001',
     type: 'ENTREE',
     status: 'FERMEE',
+    isRetour: false,
     plate: '12345-A-100',
     driverName: null,
     partnerId: null,
@@ -89,9 +90,41 @@ describe('ticket HTML', () => {
     expect(html).not.toContain('NET PRODUIT')
   })
 
-  it("affiche « Extérieur » quand aucun lieu n'est renseigné", () => {
-    const html = buildTicketHtml(ticket({ locationFromId: null }), opts)
+  it("affiche « Extérieur » quand un transfert n'a pas de lieu renseigné", () => {
+    const html = buildTicketHtml(ticket({ type: 'TRANSFERT', locationFromId: null }), opts)
+    expect(html).toContain('Origine')
     expect(html).toContain('Extérieur')
+  })
+
+  it("n'imprime que l'arrivée sur une entrée", () => {
+    const html = buildTicketHtml(ticket(), opts)
+    expect(html).toContain('Destination')
+    expect(html).not.toContain('Origine')
+  })
+
+  it("n'imprime ni origine ni destination sur une sortie", () => {
+    const html = buildTicketHtml(
+      ticket({ type: 'SORTIE', locationFromId: 2, locationToId: null }),
+      opts
+    )
+    expect(html).not.toContain('Origine')
+    expect(html).not.toContain('Destination')
+    expect(html).not.toContain('Extérieur')
+  })
+
+  it("imprime l'origine d'une sortie en retour, et le marque RETOUR", () => {
+    const html = buildTicketHtml(
+      ticket({ type: 'SORTIE', isRetour: true, locationFromId: 2, locationToId: null }),
+      opts
+    )
+    expect(html).toContain('TICKET DE SORTIE — RETOUR')
+    expect(html).toContain('Origine')
+    expect(html).toContain('Stock central')
+    expect(html).not.toContain('Destination')
+  })
+
+  it("n'ajoute pas RETOUR à un ticket ordinaire", () => {
+    expect(buildTicketHtml(ticket(), opts)).not.toContain('RETOUR')
   })
 
   it('bascule en RTL et en arabe', () => {

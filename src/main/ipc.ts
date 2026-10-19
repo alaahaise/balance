@@ -19,6 +19,7 @@ import {
   opCloseSchema,
   opFilterSchema,
   opLinesSchema,
+  opPageSchema,
   opUpdateSchema,
   simWeightSchema,
   ticketDraftSchema
@@ -168,6 +169,11 @@ export function registerIpc(): void {
   ipcMain.handle(CH.opsList, async (_e, raw) => {
     requireUser()
     return operations.list(parse(opFilterSchema, raw))
+  })
+
+  ipcMain.handle(CH.opsPage, async (_e, raw) => {
+    requireUser()
+    return operations.page(parse(opPageSchema, raw))
   })
 
   ipcMain.handle(CH.opsCancel, async (_e, raw) => {

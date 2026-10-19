@@ -9,6 +9,7 @@
  * saisi à la main finirait sinon exécuté dans la fenêtre d'impression.
  */
 import type { Lang, Location } from '@shared/channels'
+import { asksFrom, asksTo, locationFieldsFor } from '@shared/domain/locations'
 import { isManualKind } from '@shared/domain/weighing'
 import type { Operation, OperationType } from '@shared/types'
 
@@ -52,6 +53,7 @@ interface Labels {
   station: string
   outside: string
   cancelled: string
+  retour: string
   primaryTitle: string
   waitingSecond: string
   manualLegend: string
@@ -84,6 +86,7 @@ const LABELS: Record<Lang, Labels> = {
     station: 'Poste',
     outside: 'Extérieur',
     cancelled: 'TICKET ANNULÉ',
+    retour: 'RETOUR',
     primaryTitle: 'BON DE PESÉE N° 1 — À COMPLÉTER',
     waitingSecond: 'En attente de la 2e pesée',
     manualLegend: 'M = pesée manuelle',
@@ -119,6 +122,7 @@ const LABELS: Record<Lang, Labels> = {
     station: 'المحطة',
     outside: 'خارجي',
     cancelled: 'تذكرة ملغاة',
+    retour: 'مرتجع',
     primaryTitle: 'تذكرة الوزن رقم 1 — غير مكتملة',
     waitingSecond: 'في انتظار الوزن الثاني',
     manualLegend: 'M = وزن يدوي',
@@ -184,6 +188,11 @@ export function buildTicketHtml(
           `${kg(op.ecart)} kg${op.ecartOk == null ? '' : op.ecartOk ? ` — ${t.ok}` : ` — ${t.out}`}`
         )
 
+  // Seuls les lieux que ce type de ticket demande à l'opérateur sont imprimés :
+  // une sortie ne mentionne ni origine ni destination, une entrée seulement l'arrivée.
+  const fields = locationFieldsFor(op.type, op.isRetour)
+  const title = op.isRetour ? `${t.types[op.type]} — ${t.retour}` : t.types[op.type]
+
   const cancelled =
     op.status === 'ANNULEE' ? `<h2 class="cancelled">${escapeHtml(t.cancelled)}</h2>` : ''
 
@@ -243,7 +252,7 @@ export function buildTicketHtml(
 </head>
 <body>
   <h1>${escapeHtml(opts.company)}</h1>
-  <h2>${escapeHtml(t.types[op.type])}</h2>
+  <h2>${escapeHtml(title)}</h2>
   <div class="no">${escapeHtml(op.ticketNo)}</div>
   ${isPrimary ? `<h2 class="primary">${escapeHtml(t.primaryTitle)}</h2>` : ''}
   ${cancelled}
@@ -253,8 +262,8 @@ export function buildTicketHtml(
   ${linesBlock}
   ${row(t.partner, op.partnerName)}
   ${row(t.bl, op.blNo)}
-  ${row(t.from, place(op.locationFromId))}
-  ${row(t.to, place(op.locationToId))}
+  ${asksFrom(fields) ? row(t.from, place(op.locationFromId)) : ''}
+  ${asksTo(fields) ? row(t.to, place(op.locationToId)) : ''}
   ${weighing(op.first, 1)}
   ${weighing(op.second, 2)}
   ${totals}

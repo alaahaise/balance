@@ -398,4 +398,246 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
       operations.redoFirst({ operationId: empty.id, weight: 4100, isManual: false }, user, 'p')
     ).rejects.toThrow(/2e pesée est déjà faite/)
   })
+  describe('lieux et retours', () => {
+    const idOf = async (code: string): Promise<number> => {
+      const [rows] = await pool
+        .getPool()
+        .query<RowDataPacket[]>('SELECT id FROM locations WHERE code = ?', [code])
+      return Number(rows[0]?.id)
+    }
+
+    it("SORTIE : part du stock central vers l'extérieur, quels que soient les lieux envoyés", async () => {
+      const central = await idOf('STOCK')
+      const unitA = await idOf('UNITE_A')
+
+      const ticket = await operations.create(
+        { type: 'SORTIE', locationFromId: unitA, locationToId: unitA },
+        user
+      )
+      expect(ticket.isRetour).toBe(false)
+      expect(ticket.locationFromId).toBe(central)
+      expect(ticket.locationToId).toBeNull()
+
+      const updated = await operations.update(ticket.id, { locationToId: unitA }, user)
+      expect(updated.locationFromId).toBe(central)
+      expect(updated.locationToId).toBeNull()
+    })
+
+    it("ENTREE : l'arrivée choisie est gardée, à défaut le stock central ; jamais d'origine", async () => {
+      const central = await idOf('STOCK')
+      const unitB = await idOf('UNITE_B')
+
+      const defaulted = await operations.create({ type: 'ENTREE' }, user)
+      expect(defaulted.locationFromId).toBeNull()
+      expect(defaulted.locationToId).toBe(central)
+
+      const chosen = await operations.create({ type: 'ENTREE', locationToId: unitB }, user)
+      expect(chosen.locationToId).toBe(unitB)
+
+      const retouched = await operations.update(
+        chosen.id,
+        { locationFromId: unitB, locationToId: central },
+        user
+      )
+      expect(retouched.locationFromId).toBeNull()
+      expect(retouched.locationToId).toBe(central)
+    })
+
+    it('SORTIE en retour : sort du lieu choisi ; décocher le retour la ramène au stock central', async () => {
+      const central = await idOf('STOCK')
+      const unitA = await idOf('UNITE_A')
+
+      const ticket = await operations.create({ type: 'SORTIE', isRetour: true }, user)
+      expect(ticket.isRetour).toBe(true)
+      expect(ticket.locationFromId).toBe(central)
+
+      const fromUnit = await operations.update(ticket.id, { locationFromId: unitA }, user)
+      expect(fromUnit.locationFromId).toBe(unitA)
+
+      const normal = await operations.update(ticket.id, { isRetour: false }, user)
+      expect(normal.isRetour).toBe(false)
+      expect(normal.locationFromId).toBe(central)
+    })
+
+    it("TRANSFERT : les deux lieux restent ceux de l'opérateur", async () => {
+      const unitA = await idOf('UNITE_A')
+      const unitB = await idOf('UNITE_B')
+      const ticket = await operations.create(
+        { type: 'TRANSFERT', locationFromId: unitA, locationToId: unitB },
+        user
+      )
+      expect(ticket.locationFromId).toBe(unitA)
+      expect(ticket.locationToId).toBe(unitB)
+    })
+
+    it('un retour fermé bouge le stock dans le même sens qu’un ticket ordinaire', async () => {
+      const unitA = await idOf('UNITE_A')
+      const central = await idOf('STOCK')
+
+      // retour client : la marchandise entre en unité A
+      const back = await operations.create(
+        {
+          type: 'ENTREE',
+          isRetour: true,
+          locationToId: unitA,
+          lines: [{ productCode: 'CMV RETOUR', quantityKg: 1000 }]
+        },
+        user
+      )
+      await operations.capture({ operationId: back.id, weight: 9000, isManual: false }, user, 'p')
+      await operations.capture({ operationId: back.id, weight: 8000, isManual: false }, user, 'p')
+      await operations.close(back.id, user)
+
+      // retour fournisseur : la marchandise sort du stock central
+      const away = await operations.create(
+        {
+          type: 'SORTIE',
+          isRetour: true,
+          lines: [{ productCode: 'CMV RETOUR', quantityKg: 500 }]
+        },
+        user
+      )
+      await operations.capture({ operationId: away.id, weight: 6000, isManual: false }, user, 'p')
+      await operations.capture({ operationId: away.id, weight: 6500, isManual: false }, user, 'p')
+      await operations.close(away.id, user)
+
+      const [moves] = await pool.getPool().query<RowDataPacket[]>(
+        `SELECT operation_id, location_id, qty_in, qty_out FROM v_stock_moves
+          WHERE operation_id IN (?) ORDER BY operation_id`,
+        [[back.id, away.id]]
+      )
+      expect(moves).toHaveLength(2)
+      expect(moves[0]).toMatchObject({ location_id: unitA })
+      expect(Number(moves[0]?.qty_in)).toBe(1000)
+      expect(moves[1]).toMatchObject({ location_id: central })
+      expect(Number(moves[1]?.qty_out)).toBe(500)
+    })
+  })
+  it('filtre les tickets par date de création, jours inclus', async () => {
+    const ticket = await operations.create({ type: 'TIERS', plate: 'DATE-FILTER-1' }, user)
+    await pool
+      .getPool()
+      .query("UPDATE operations SET created_at = '2020-03-15 23:30:00' WHERE id = ?", [ticket.id])
+
+    const ids = async (dateFrom?: string, dateTo?: string): Promise<number[]> =>
+      (await operations.list({ search: 'DATE-FILTER-1', dateFrom, dateTo })).map((o) => o.id)
+
+    expect(await ids()).toEqual([ticket.id])
+    expect(await ids('2020-03-15', '2020-03-15')).toEqual([ticket.id]) // tard le dernier jour : inclus
+    expect(await ids('2020-03-16')).toEqual([])
+    expect(await ids(undefined, '2020-03-14')).toEqual([])
+    expect(await ids('2020-03-01', '2020-03-31')).toEqual([ticket.id])
+  })
+  describe('liste paginée', () => {
+    const make = async (plate: string, type: 'TIERS' | 'ENTREE' = 'TIERS'): Promise<number> =>
+      (await operations.create({ type, plate }, user)).id
+
+    it('découpe en pages sans doublon ni oubli, du plus récent au plus ancien', async () => {
+      const made: number[] = []
+      for (let i = 0; i < 7; i++) made.push(await make(`PGTEST-${i}`))
+
+      const base = { type: 'TIERS' as const, search: 'PGTEST', pageSize: 3 }
+      const p1 = await operations.page({ ...base, page: 1 })
+      const p2 = await operations.page({ ...base, page: 2 })
+      const p3 = await operations.page({ ...base, page: 3 })
+
+      expect([p1.total, p1.pages, p1.pageSize]).toEqual([7, 3, 3])
+      expect([p1.rows.length, p2.rows.length, p3.rows.length]).toEqual([3, 3, 1])
+
+      const seen = [...p1.rows, ...p2.rows, ...p3.rows].map((o) => o.id)
+      expect(new Set(seen).size).toBe(7) // aucun doublon
+      expect([...seen].sort((a, b) => a - b)).toEqual([...made].sort((a, b) => a - b)) // aucun oubli
+      expect(seen).toEqual([...seen].sort((a, b) => b - a)) // plus récent d'abord, même seconde
+    })
+
+    it('ramène une page trop lointaine à la dernière, et borne la taille de page', async () => {
+      const far = await operations.page({
+        type: 'TIERS',
+        search: 'PGTEST',
+        page: 99,
+        pageSize: 3
+      })
+      expect(far.page).toBe(3)
+      expect(far.rows).toHaveLength(1)
+
+      const huge = await operations.page({ type: 'TIERS', search: 'PGTEST', pageSize: 100000 })
+      expect(huge.pageSize).toBe(100)
+
+      const none = await operations.page({ type: 'TIERS', search: 'AUCUN-TICKET-NE-CORRESPOND' })
+      expect([none.total, none.pages, none.page, none.rows.length]).toEqual([0, 1, 1, 0])
+    })
+
+    it('trouve un matricule sans tenir compte de la casse, des espaces ni des tirets', async () => {
+      const id = await make('12345-116-16')
+      for (const term of ['12345 116 16', '1234511616', '12345-116-16', '116 16']) {
+        const found = await operations.page({ type: 'TIERS', search: term })
+        expect(found.rows.map((o) => o.id)).toContain(id)
+      }
+      const lower = await make('ab-123-cd')
+      const found = await operations.page({ type: 'TIERS', search: 'AB123CD' })
+      expect(found.rows.map((o) => o.id)).toContain(lower)
+    })
+
+    it('cherche « % » et « _ » tels quels, sans les traiter comme des jokers', async () => {
+      const literal = await make('WILD%CARD')
+      const other = await make('WILDXCARD')
+      const found = await operations.page({ type: 'TIERS', search: 'WILD%CARD' })
+      expect(found.rows.map((o) => o.id)).toEqual([literal])
+      expect(found.rows.map((o) => o.id)).not.toContain(other)
+
+      const underscore = await operations.page({ type: 'TIERS', search: 'WILD_CARD' })
+      expect(underscore.rows).toHaveLength(0)
+    })
+
+    it('« en attente de la 2e pesée » : pesé une fois seulement', async () => {
+      const waiting = await make('PGWAIT-1', 'ENTREE')
+      const fresh = await make('PGWAIT-2', 'ENTREE') // aucune pesée
+      const done = await make('PGWAIT-3', 'ENTREE')
+
+      await operations.capture({ operationId: waiting, weight: 9000, isManual: false }, user, 'p')
+      await operations.capture({ operationId: done, weight: 9000, isManual: false }, user, 'p')
+      await operations.capture(
+        {
+          operationId: done,
+          weight: 4000,
+          isManual: false,
+          lines: [{ productCode: 'CIMENT', quantityKg: 5000 }]
+        },
+        user,
+        'p'
+      )
+
+      const list = await operations.page({
+        type: 'ENTREE',
+        status: 'OUVERTE',
+        awaitingSecond: true,
+        search: 'PGWAIT'
+      })
+      expect(list.rows.map((o) => o.id)).toEqual([waiting])
+      expect(list.total).toBe(1)
+      expect(list.rows.map((o) => o.id)).not.toContain(fresh)
+      expect(list.rows.map((o) => o.id)).not.toContain(done)
+    })
+
+    it('combine recherche, période et page sur le même total', async () => {
+      const id = await make('PGDATE-1')
+      await pool
+        .getPool()
+        .query("UPDATE operations SET created_at = '2019-06-15 23:59:59' WHERE id = ?", [id])
+
+      const inRange = await operations.page({
+        type: 'TIERS',
+        search: 'PGDATE',
+        dateFrom: '2019-06-15',
+        dateTo: '2019-06-15'
+      })
+      expect(inRange.total).toBe(1)
+      const outside = await operations.page({
+        type: 'TIERS',
+        search: 'PGDATE',
+        dateFrom: '2019-06-16'
+      })
+      expect(outside.total).toBe(0)
+    })
+  })
 })

@@ -32,6 +32,7 @@ export const CH = {
   opsCapture: 'ops:capture',
   opsRedoFirst: 'ops:redoFirst',
   opsList: 'ops:list',
+  opsPage: 'ops:page',
   opsCancel: 'ops:cancel',
   opsClose: 'ops:close',
   opsUpdate: 'ops:update',
@@ -94,6 +95,27 @@ export interface OpFilter {
   status?: OperationStatus | null
   limit?: number
   search?: string | null
+  /** Jours inclus, au format `YYYY-MM-DD`, sur la date de création du ticket. */
+  dateFrom?: string | null
+  dateTo?: string | null
+  /** Tickets pesés une fois, en attente de la 2e pesée (liste de la 2e balance). */
+  awaitingSecond?: boolean
+}
+
+/** Une page de la liste : le tri est fixe (plus récent d'abord). */
+export interface OpPageFilter extends Omit<OpFilter, 'limit'> {
+  /** 1-based. Au-delà de la dernière page, la dernière est servie. */
+  page?: number
+  pageSize?: number
+}
+
+export interface OpPage {
+  rows: Operation[]
+  /** Nombre de tickets correspondant au filtre, toutes pages confondues. */
+  total: number
+  page: number
+  pageSize: number
+  pages: number
 }
 
 export interface CaptureInput {
@@ -124,6 +146,7 @@ export interface CancelInput {
  * passent par `setLines`, qui remplace la liste entière.
  */
 export interface OpUpdate {
+  isRetour?: boolean
   plate?: string | null
   driverName?: string | null
   partnerName?: string | null
@@ -164,6 +187,8 @@ export interface AppApi {
     /** Refait la 1re pesée (camion repassé sur la balance). L'ancienne reste tracée. */
     redoFirst(input: CaptureInput): Promise<Operation>
     list(filter: OpFilter): Promise<Operation[]>
+    /** Liste paginée côté serveur : seule la page demandée est lue et renvoyée. */
+    page(filter: OpPageFilter): Promise<OpPage>
     cancel(id: number, reason: string): Promise<void>
     /** Enregistre le ticket après confirmation de l'opérateur. */
     close(id: number): Promise<Operation>

@@ -1,11 +1,18 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { Location, OpUpdate } from '@shared/channels'
+import { asksFrom, asksTo, locationFieldsFor } from '@shared/domain/locations'
 import type { Operation, OperationStatus, OperationType } from '@shared/types'
 import { api, call, errorMessage, formatDateTime, formatKg } from '../api'
+import LocationPickers from '../components/LocationPickers'
+import Pagination from '../components/Pagination'
+import RetourToggle from '../components/RetourToggle'
+import TicketFilters from '../components/TicketFilters'
 import TicketPreview from '../components/TicketPreview'
+import { useTicketPage } from '../hooks/useTicketPage'
 import { useI18n } from '../i18n'
 
 interface EditDraft {
+  isRetour: boolean
   plate: string
   driverName: string
   partnerName: string
@@ -18,6 +25,7 @@ interface EditDraft {
 
 function toDraft(op: Operation): EditDraft {
   return {
+    isRetour: op.isRetour,
     plate: op.plate ?? '',
     driverName: op.driverName ?? '',
     partnerName: op.partnerName ?? '',
@@ -39,8 +47,6 @@ function toDraft(op: Operation): EditDraft {
 export default function Operations({ type }: { type: OperationType }) {
   const { t, lang } = useI18n()
   const [status, setStatus] = useState<OperationStatus | null>(null)
-  const [search, setSearch] = useState('')
-  const [rows, setRows] = useState<Operation[]>([])
   const [locations, setLocations] = useState<Location[]>([])
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -50,27 +56,10 @@ export default function Operations({ type }: { type: OperationType }) {
   const [draft, setDraft] = useState<EditDraft | null>(null)
   const [preview, setPreview] = useState<{ id: number; html: string } | null>(null)
 
-  const reload = useCallback(async (): Promise<void> => {
-    try {
-      setRows(
-        await call(
-          api.ops.list({
-            type,
-            status,
-            search: search.trim() === '' ? null : search.trim(),
-            limit: 200
-          })
-        )
-      )
-      setError(null)
-    } catch (err) {
-      setError(errorMessage(err))
-    }
-  }, [type, status, search])
-
-  useEffect(() => {
-    void reload()
-  }, [reload])
+  // Liste paginée côté serveur : seule la page affichée est chargée.
+  const list = useTicketPage({ type, status })
+  const reload = list.reload
+  const rows = list.data?.rows ?? []
 
   useEffect(() => {
     api.ref
@@ -107,14 +96,21 @@ export default function Operations({ type }: { type: OperationType }) {
     setBusy(true)
     try {
       const patch: OpUpdate = {
+        isRetour: draft.isRetour,
         plate: draft.plate || null,
         driverName: draft.driverName || null,
         partnerName: draft.partnerName || null,
         blNo: draft.blNo || null,
         blDate: draft.blDate || null,
-        locationFromId: draft.locationFromId === '' ? null : Number(draft.locationFromId),
-        locationToId: draft.locationToId === '' ? null : Number(draft.locationToId),
         notes: draft.notes || null
+      }
+      // Seuls les lieux demandés pour ce type sont envoyés (le serveur fixe les autres).
+      const fields = locationFieldsFor(type, draft.isRetour)
+      if (asksFrom(fields)) {
+        patch.locationFromId = draft.locationFromId === '' ? null : Number(draft.locationFromId)
+      }
+      if (asksTo(fields)) {
+        patch.locationToId = draft.locationToId === '' ? null : Number(draft.locationToId)
       }
       await call(api.ops.update(id, patch))
       setEditingId(null)
@@ -150,28 +146,25 @@ export default function Operations({ type }: { type: OperationType }) {
     }
   }
 
-  const editField = (key: keyof EditDraft) => ({
+  const editField = (key: Exclude<keyof EditDraft, 'isRetour'>) => ({
     value: draft?.[key] ?? '',
     onChange: (e: { target: { value: string } }) =>
       setDraft((current) => (current ? { ...current, [key]: e.target.value } : current))
   })
 
-  const locationOptions = (
-    <>
-      <option value="">{t('station.outside')}</option>
-      {locations.map((l) => (
-        <option key={l.id} value={l.id}>
-          {lang === 'ar' && l.nameAr ? l.nameAr : l.name}
-        </option>
-      ))}
-    </>
-  )
-
   return (
     <div className="card">
       <h2>{`${t('ops.title')} — ${t(`station.type.${type}`)}`}</h2>
 
-      <div className="row">
+      <TicketFilters
+        search={list.search}
+        onSearch={list.setSearch}
+        placeholder={t('common.search')}
+        dateFrom={list.dateFrom}
+        dateTo={list.dateTo}
+        onDateFrom={list.setDateFrom}
+        onDateTo={list.setDateTo}
+      >
         <select
           value={status ?? ''}
           onChange={(e) => setStatus((e.target.value || null) as OperationStatus | null)}
@@ -181,17 +174,12 @@ export default function Operations({ type }: { type: OperationType }) {
           <option value="FERMEE">{t('ops.status.FERMEE')}</option>
           <option value="ANNULEE">{t('ops.status.ANNULEE')}</option>
         </select>
-        <input
-          placeholder={t('common.search')}
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-        />
         <button type="button" className="ghost" onClick={() => void reload()}>
           {t('common.refresh')}
         </button>
-      </div>
+      </TicketFilters>
 
-      {error && <p className="error">{error}</p>}
+      {(error ?? list.error) && <p className="error">{error ?? list.error}</p>}
 
       <table>
         <thead>
@@ -230,15 +218,31 @@ export default function Operations({ type }: { type: OperationType }) {
                       {t('station.blNo')}
                       <input {...editField('blNo')} />
                     </label>
-                    <label>
-                      {t('station.locationFrom')}
-                      <select {...editField('locationFromId')}>{locationOptions}</select>
-                    </label>
-                    <label>
-                      {t('station.locationTo')}
-                      <select {...editField('locationToId')}>{locationOptions}</select>
-                    </label>
                   </div>
+                  <RetourToggle
+                    type={type}
+                    checked={draft?.isRetour ?? false}
+                    onChange={(value) =>
+                      setDraft((current) => (current ? { ...current, isRetour: value } : current))
+                    }
+                  />
+                  <LocationPickers
+                    type={type}
+                    isRetour={draft?.isRetour ?? false}
+                    locations={locations}
+                    from={draft?.locationFromId ?? ''}
+                    to={draft?.locationToId ?? ''}
+                    onFrom={(value) =>
+                      setDraft((current) =>
+                        current ? { ...current, locationFromId: value } : current
+                      )
+                    }
+                    onTo={(value) =>
+                      setDraft((current) =>
+                        current ? { ...current, locationToId: value } : current
+                      )
+                    }
+                  />
                   <label>
                     {t('station.notes')}
                     <textarea rows={2} {...editField('notes')} />
@@ -269,6 +273,7 @@ export default function Operations({ type }: { type: OperationType }) {
               <tr key={row.id} className={row.status === 'ANNULEE' ? 'cancelled' : undefined}>
                 <td>
                   <strong>{row.ticketNo}</strong>
+                  {row.isRetour && <span className="badge warn">{t('station.retour')}</span>}
                   <br />
                   <small className="muted">{t(`ops.status.${row.status}`)}</small>
                   {row.status !== 'ANNULEE' && (
@@ -356,7 +361,11 @@ export default function Operations({ type }: { type: OperationType }) {
                         >
                           {t('common.confirm')}
                         </button>
-                        <button type="button" className="ghost" onClick={() => setCancellingId(null)}>
+                        <button
+                          type="button"
+                          className="ghost"
+                          onClick={() => setCancellingId(null)}
+                        >
                           {t('common.cancel')}
                         </button>
                       </>
@@ -374,7 +383,7 @@ export default function Operations({ type }: { type: OperationType }) {
               </tr>
             )
           )}
-          {rows.length === 0 && (
+          {rows.length === 0 && !list.loading && (
             <tr>
               <td colSpan={9} className="muted">
                 {t('ops.empty')}
@@ -383,6 +392,18 @@ export default function Operations({ type }: { type: OperationType }) {
           )}
         </tbody>
       </table>
+
+      {list.data && (
+        <Pagination
+          page={list.data.page}
+          pages={list.data.pages}
+          total={list.data.total}
+          pageSize={list.data.pageSize}
+          loading={list.loading}
+          onPage={list.setPage}
+          onPageSize={list.setPageSize}
+        />
+      )}
 
       {preview && (
         <TicketPreview

@@ -1,0 +1,293 @@
+From fd74f0fa6bfee5ae581ba3e1e1072f870dc6a25d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 20:45:15 +0100
+Subject: [PATCH] Filtre par date sur les tickets et la 2e balance
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- OpFilter : dateFrom / dateTo (jours inclus, sur la date de création)
+- Composant DateRangeFilter dans la page Tickets et la liste d'attente de la 2e balance
+- Test d'intégration du filtre
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016BJ1sCkcEcDNZYYUKRi2LY
+---
+ src/main/db/operations.integration.test.ts    | 15 ++++++
+ src/main/db/operations.ts                     |  9 ++++
+ .../src/components/DateRangeFilter.tsx        | 53 +++++++++++++++++++
+ src/renderer/src/i18n.tsx                     |  6 +++
+ src/renderer/src/pages/Balance2.tsx           | 18 ++++++-
+ src/renderer/src/pages/Operations.tsx         |  8 ++-
+ src/shared/channels.ts                        |  3 ++
+ src/shared/schemas.ts                         | 10 +++-
+ 8 files changed, 118 insertions(+), 4 deletions(-)
+ create mode 100644 src/renderer/src/components/DateRangeFilter.tsx
+
+diff --git a/src/main/db/operations.integration.test.ts b/src/main/db/operations.integration.test.ts
+index e32d1d1..847d302 100644
+--- a/src/main/db/operations.integration.test.ts
++++ b/src/main/db/operations.integration.test.ts
+@@ -513,4 +513,19 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
+       expect(Number(moves[1]?.qty_out)).toBe(500)
+     })
+   })
++  it('filtre les tickets par date de création, jours inclus', async () => {
++    const ticket = await operations.create({ type: 'TIERS', plate: 'DATE-FILTER-1' }, user)
++    await pool
++      .getPool()
++      .query("UPDATE operations SET created_at = '2020-03-15 23:30:00' WHERE id = ?", [ticket.id])
++
++    const ids = async (dateFrom?: string, dateTo?: string): Promise<number[]> =>
++      (await operations.list({ search: 'DATE-FILTER-1', dateFrom, dateTo })).map((o) => o.id)
++
++    expect(await ids()).toEqual([ticket.id])
++    expect(await ids('2020-03-15', '2020-03-15')).toEqual([ticket.id]) // tard le dernier jour : inclus
++    expect(await ids('2020-03-16')).toEqual([])
++    expect(await ids(undefined, '2020-03-14')).toEqual([])
++    expect(await ids('2020-03-01', '2020-03-31')).toEqual([ticket.id])
++  })
+ })
+diff --git a/src/main/db/operations.ts b/src/main/db/operations.ts
+index 8da4e99..7a9ec4f 100644
+--- a/src/main/db/operations.ts
++++ b/src/main/db/operations.ts
+@@ -549,6 +549,15 @@ export async function list(filter: OpFilter): Promise<Operation[]> {
+     where.push('o.status = ?')
+     params.push(filter.status)
+   }
++  // Jours inclus : de 00:00 du premier jour jusqu'à la fin du dernier.
++  if (filter.dateFrom) {
++    where.push('o.created_at >= ?')
++    params.push(`${filter.dateFrom} 00:00:00`)
++  }
++  if (filter.dateTo) {
++    where.push('o.created_at < DATE_ADD(?, INTERVAL 1 DAY)')
++    params.push(filter.dateTo)
++  }
+   if (filter.search) {
+     where.push(
+       `(o.ticket_no LIKE ? OR o.plate LIKE ? OR o.bl_no LIKE ? OR o.partner_name LIKE ?
+diff --git a/src/renderer/src/components/DateRangeFilter.tsx b/src/renderer/src/components/DateRangeFilter.tsx
+new file mode 100644
+index 0000000..ea584e4
+--- /dev/null
++++ b/src/renderer/src/components/DateRangeFilter.tsx
+@@ -0,0 +1,53 @@
++import { useI18n } from '../i18n'
++
++/**
++ * Filtre par date de création du ticket : « du … au … » (jours inclus).
++ * Les valeurs sont des dates locales `YYYY-MM-DD` ; une valeur vide = pas de borne.
++ */
++export default function DateRangeFilter({
++  from,
++  to,
++  onFrom,
++  onTo
++}: {
++  from: string
++  to: string
++  onFrom: (value: string) => void
++  onTo: (value: string) => void
++}) {
++  const { t } = useI18n()
++  return (
++    <>
++      <label className="inline">
++        {t('filter.from')}
++        <input
++          type="date"
++          value={from}
++          max={to || undefined}
++          onChange={(e) => onFrom(e.target.value)}
++        />
++      </label>
++      <label className="inline">
++        {t('filter.to')}
++        <input
++          type="date"
++          value={to}
++          min={from || undefined}
++          onChange={(e) => onTo(e.target.value)}
++        />
++      </label>
++      {(from !== '' || to !== '') && (
++        <button
++          type="button"
++          className="ghost"
++          onClick={() => {
++            onFrom('')
++            onTo('')
++          }}
++        >
++          {t('filter.clearDates')}
++        </button>
++      )}
++    </>
++  )
++}
+diff --git a/src/renderer/src/i18n.tsx b/src/renderer/src/i18n.tsx
+index baee8fb..b9ba539 100644
+--- a/src/renderer/src/i18n.tsx
++++ b/src/renderer/src/i18n.tsx
+@@ -26,6 +26,9 @@ const fr = {
+   'common.confirm': 'Confirmer',
+   'common.close': 'Fermer',
+   'common.all': 'Tous',
++  'filter.from': 'Du',
++  'filter.to': 'Au',
++  'filter.clearDates': 'Toutes les dates',
+   'common.detected': 'Ports détectés',
+   'common.optional': 'facultatif',
+   'common.required': 'champ obligatoire',
+@@ -224,6 +227,9 @@ const ar: Record<TKey, string> = {
+   'common.confirm': 'تأكيد',
+   'common.close': 'إغلاق',
+   'common.all': 'الكل',
++  'filter.from': 'من',
++  'filter.to': 'إلى',
++  'filter.clearDates': 'كل التواريخ',
+   'common.detected': 'المنافذ المكتشفة',
+   'common.optional': 'اختياري',
+   'common.required': 'حقل إلزامي',
+diff --git a/src/renderer/src/pages/Balance2.tsx b/src/renderer/src/pages/Balance2.tsx
+index 13b5a62..45c4453 100644
+--- a/src/renderer/src/pages/Balance2.tsx
++++ b/src/renderer/src/pages/Balance2.tsx
+@@ -6,6 +6,7 @@ import { isManualKind } from '@shared/domain/weighing'
+ import type { Operation, OperationType, ProductLine, WeightSample } from '@shared/types'
+ import { api, call, errorMessage, formatDateTime, formatKg } from '../api'
+ import CaptureBox, { type CaptureRequest } from '../components/CaptureBox'
++import DateRangeFilter from '../components/DateRangeFilter'
+ import LocationPickers from '../components/LocationPickers'
+ import ManualMark from '../components/ManualMark'
+ import ProductLines, { cleanLines, hasIncompleteLine } from '../components/ProductLines'
+@@ -69,6 +70,8 @@ export default function Balance2({ type }: { type: OperationType }) {
+   const [pending, setPending] = useState<Operation[]>([])
+   const [selected, setSelected] = useState<Operation | null>(null)
+   const [query, setQuery] = useState('')
++  const [dateFrom, setDateFrom] = useState('')
++  const [dateTo, setDateTo] = useState('')
+   const [form, setForm] = useState<CompleteForm>(EMPTY_FORM)
+   const [lines, setLines] = useState<ProductLine[]>([])
+   const [locations, setLocations] = useState<Location[]>([])
+@@ -83,13 +86,21 @@ export default function Balance2({ type }: { type: OperationType }) {
+ 
+   const loadPending = useCallback(async (): Promise<void> => {
+     try {
+-      const rows = await call(api.ops.list({ type, status: 'OUVERTE', limit: 200 }))
++      const rows = await call(
++        api.ops.list({
++          type,
++          status: 'OUVERTE',
++          limit: 200,
++          dateFrom: dateFrom || null,
++          dateTo: dateTo || null
++        })
++      )
+       setPending(rows.filter((r) => r.first != null && r.second == null))
+       setError(null)
+     } catch (err) {
+       setError(errorMessage(err))
+     }
+-  }, [type])
++  }, [type, dateFrom, dateTo])
+ 
+   useEffect(() => {
+     void loadPending()
+@@ -288,6 +299,9 @@ export default function Balance2({ type }: { type: OperationType }) {
+             value={query}
+             onChange={(e) => setQuery(e.target.value)}
+           />
++          <div className="row">
++            <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
++          </div>
+ 
+           <table>
+             <thead>
+diff --git a/src/renderer/src/pages/Operations.tsx b/src/renderer/src/pages/Operations.tsx
+index 9d57bd2..09849a2 100644
+--- a/src/renderer/src/pages/Operations.tsx
++++ b/src/renderer/src/pages/Operations.tsx
+@@ -3,6 +3,7 @@ import type { Location, OpUpdate } from '@shared/channels'
+ import { asksFrom, asksTo, locationFieldsFor } from '@shared/domain/locations'
+ import type { Operation, OperationStatus, OperationType } from '@shared/types'
+ import { api, call, errorMessage, formatDateTime, formatKg } from '../api'
++import DateRangeFilter from '../components/DateRangeFilter'
+ import LocationPickers from '../components/LocationPickers'
+ import RetourToggle from '../components/RetourToggle'
+ import TicketPreview from '../components/TicketPreview'
+@@ -45,6 +46,8 @@ export default function Operations({ type }: { type: OperationType }) {
+   const { t, lang } = useI18n()
+   const [status, setStatus] = useState<OperationStatus | null>(null)
+   const [search, setSearch] = useState('')
++  const [dateFrom, setDateFrom] = useState('')
++  const [dateTo, setDateTo] = useState('')
+   const [rows, setRows] = useState<Operation[]>([])
+   const [locations, setLocations] = useState<Location[]>([])
+   const [error, setError] = useState<string | null>(null)
+@@ -63,6 +66,8 @@ export default function Operations({ type }: { type: OperationType }) {
+             type,
+             status,
+             search: search.trim() === '' ? null : search.trim(),
++            dateFrom: dateFrom || null,
++            dateTo: dateTo || null,
+             limit: 200
+           })
+         )
+@@ -71,7 +76,7 @@ export default function Operations({ type }: { type: OperationType }) {
+     } catch (err) {
+       setError(errorMessage(err))
+     }
+-  }, [type, status, search])
++  }, [type, status, search, dateFrom, dateTo])
+ 
+   useEffect(() => {
+     void reload()
+@@ -187,6 +192,7 @@ export default function Operations({ type }: { type: OperationType }) {
+           value={search}
+           onChange={(e) => setSearch(e.target.value)}
+         />
++        <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
+         <button type="button" className="ghost" onClick={() => void reload()}>
+           {t('common.refresh')}
+         </button>
+diff --git a/src/shared/channels.ts b/src/shared/channels.ts
+index a01983e..7e90c79 100644
+--- a/src/shared/channels.ts
++++ b/src/shared/channels.ts
+@@ -94,6 +94,9 @@ export interface OpFilter {
+   status?: OperationStatus | null
+   limit?: number
+   search?: string | null
++  /** Jours inclus, au format `YYYY-MM-DD`, sur la date de création du ticket. */
++  dateFrom?: string | null
++  dateTo?: string | null
+ }
+ 
+ export interface CaptureInput {
+diff --git a/src/shared/schemas.ts b/src/shared/schemas.ts
+index e74dbb2..d77b9a5 100644
+--- a/src/shared/schemas.ts
++++ b/src/shared/schemas.ts
+@@ -81,7 +81,15 @@ export const opFilterSchema = z.object({
+   type: z.enum(OPERATION_TYPES).nullish(),
+   status: z.enum(['OUVERTE', 'FERMEE', 'ANNULEE']).nullish(),
+   limit: z.number().int().min(1).max(500).optional(),
+-  search: z.string().trim().max(64).nullish()
++  search: z.string().trim().max(64).nullish(),
++  dateFrom: z
++    .string()
++    .regex(/^\d{4}-\d{2}-\d{2}$/)
++    .nullish(),
++  dateTo: z
++    .string()
++    .regex(/^\d{4}-\d{2}-\d{2}$/)
++    .nullish()
+ })
+ 
+ export const loginSchema = z.object({
+-- 
+2.43.0
+

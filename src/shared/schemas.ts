@@ -6,6 +6,7 @@
  * Utilisé uniquement par le processus principal (dépend de zod).
  */
 import { z } from 'zod'
+import { MAX_PAGE_SIZE } from './domain/paging'
 import { OPERATION_TYPES } from './types'
 
 export const dbConfigSchema = z.object({
@@ -49,6 +50,7 @@ export const productLineSchema = z.object({
 
 export const ticketDraftSchema = z.object({
   type: z.enum(OPERATION_TYPES),
+  isRetour: z.boolean().optional(),
   plate: z.string().trim().max(32).nullish(),
   driverName: z.string().trim().max(128).nullish(),
   partnerId: z.number().int().positive().nullish(),
@@ -80,7 +82,21 @@ export const opFilterSchema = z.object({
   type: z.enum(OPERATION_TYPES).nullish(),
   status: z.enum(['OUVERTE', 'FERMEE', 'ANNULEE']).nullish(),
   limit: z.number().int().min(1).max(500).optional(),
-  search: z.string().trim().max(64).nullish()
+  search: z.string().trim().max(64).nullish(),
+  dateFrom: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .nullish(),
+  dateTo: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .nullish(),
+  awaitingSecond: z.boolean().optional()
+})
+
+export const opPageSchema = opFilterSchema.omit({ limit: true }).extend({
+  page: z.number().int().min(1).max(1_000_000).optional(),
+  pageSize: z.number().int().min(1).max(MAX_PAGE_SIZE).optional()
 })
 
 export const loginSchema = z.object({
@@ -101,6 +117,7 @@ export const opCloseSchema = z.object({
 export const opUpdateSchema = z.object({
   id: z.number().int().positive(),
   patch: z.object({
+    isRetour: z.boolean().optional(),
     plate: z.string().trim().max(32).nullish(),
     driverName: z.string().trim().max(128).nullish(),
     partnerName: z.string().trim().max(160).nullish(),

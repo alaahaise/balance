@@ -29,6 +29,11 @@ export interface ProductLine {
 /** Ce qu'un opérateur remplit avant la première pesée. */
 export interface TicketDraft {
   type: OperationType
+  /**
+   * Retour : marchandise vendue qui revient (ENTREE) ou marchandise renvoyée au
+   * fournisseur (SORTIE). Le stock bouge dans le même sens que sans le drapeau.
+   */
+  isRetour?: boolean
   plate?: string | null
   driverName?: string | null
   partnerId?: number | null
@@ -56,6 +61,7 @@ export interface Operation extends TicketDraft {
   id: number
   ticketNo: string
   status: OperationStatus
+  isRetour: boolean
   first: Weighing | null
   second: Weighing | null
   /** Somme des lignes, figée à la 2e pesée. */

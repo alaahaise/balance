@@ -43,6 +43,7 @@ const api: AppApi = {
     capture: (input) => invoke(CH.opsCapture, input),
     redoFirst: (input) => invoke(CH.opsRedoFirst, input),
     list: (filter) => invoke(CH.opsList, filter),
+    page: (filter) => invoke(CH.opsPage, filter),
     cancel: (id, reason) => invoke(CH.opsCancel, { id, reason }),
     close: (id) => invoke(CH.opsClose, { id }),
     update: (id, patch) => invoke(CH.opsUpdate, { id, patch }),

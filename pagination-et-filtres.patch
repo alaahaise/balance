@@ -1,0 +1,1321 @@
+From c5aaee840f058bd850fe018252b9e18f08d467f7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 19 Oct 2026 02:20:09 +0100
+Subject: [PATCH] =?UTF-8?q?Pagination=20c=C3=B4t=C3=A9=20serveur=20et=20ba?=
+ =?UTF-8?q?rre=20de=20filtres=20des=20listes=20de=20tickets?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- ops.page : page + total renvoyés par le serveur (taille bornée à 100, page hors
+  limite ramenée à la dernière, tri total created_at DESC, id DESC)
+- Jointure différée : la page se choisit sur `operations` seule, puis `users` est
+  joint pour ces lignes (≈ 560 ms -> ≈ 10 ms sur 300 000 tickets)
+- Migration 006 : index (type, status, created_at) pour le filtre, le tri et le COUNT
+- Recherche côté serveur : jokers LIKE échappés, matricule tolérant (casse, espaces, tirets)
+- Liste « en attente de la 2e pesée » filtrée en SQL (awaitingSecond)
+- Barre de filtres : recherche à gauche, période à droite ; composant Pagination
+- Hook useTicketPage : debounce de la frappe, retour page 1 au changement de filtre,
+  réponses tardives ignorées
+- Tests unitaires et d'intégration
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016BJ1sCkcEcDNZYYUKRi2LY
+---
+ migrations/006_ticket_list_indexes.sql        |  12 ++
+ src/main/db/migrate.ts                        |   4 +-
+ src/main/db/operations.integration.test.ts    | 112 ++++++++++++++++
+ src/main/db/operations.ts                     | 126 +++++++++++++++---
+ src/main/ipc.ts                               |   6 +
+ src/preload/index.ts                          |   1 +
+ .../src/components/DateRangeFilter.tsx        |   4 +-
+ src/renderer/src/components/Pagination.tsx    |  75 +++++++++++
+ src/renderer/src/components/TicketFilters.tsx |  44 ++++++
+ src/renderer/src/hooks/useTicketPage.ts       | 110 +++++++++++++++
+ src/renderer/src/i18n.tsx                     |  10 ++
+ src/renderer/src/pages/Balance2.tsx           |  74 +++++-----
+ src/renderer/src/pages/Operations.tsx         |  71 +++++-----
+ src/renderer/src/styles.css                   |  54 ++++++++
+ src/shared/channels.ts                        |  21 +++
+ src/shared/domain/paging.test.ts              |  50 +++++++
+ src/shared/domain/paging.ts                   |  53 ++++++++
+ src/shared/domain/search.test.ts              |  22 +++
+ src/shared/domain/search.ts                   |  19 +++
+ src/shared/schemas.ts                         |   9 +-
+ 20 files changed, 776 insertions(+), 101 deletions(-)
+ create mode 100644 migrations/006_ticket_list_indexes.sql
+ create mode 100644 src/renderer/src/components/Pagination.tsx
+ create mode 100644 src/renderer/src/components/TicketFilters.tsx
+ create mode 100644 src/renderer/src/hooks/useTicketPage.ts
+ create mode 100644 src/shared/domain/paging.test.ts
+ create mode 100644 src/shared/domain/paging.ts
+ create mode 100644 src/shared/domain/search.test.ts
+ create mode 100644 src/shared/domain/search.ts
+
+diff --git a/migrations/006_ticket_list_indexes.sql b/migrations/006_ticket_list_indexes.sql
+new file mode 100644
+index 0000000..b7c0155
+--- /dev/null
++++ b/migrations/006_ticket_list_indexes.sql
+@@ -0,0 +1,12 @@
++-- 006 — Index de la liste des tickets (pagination).
++--
++-- Les listes (Tickets, 2e balance) filtrent par type et statut, bornent la date de
++-- création et trient du plus récent au plus ancien :
++--   WHERE type = ? AND status = ? AND created_at >= ? AND created_at < ?
++--   ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
++-- Cet index couvre le filtre ET le tri (InnoDB y ajoute `id`) : la base lit la
++-- page demandée sans trier toute la table, et compte les lignes sans les lire.
++-- Il remplace `ix_ops_type_date` (type, created_at) pour ces requêtes, mais on ne
++-- l'enlève pas : une migration appliquée ne se défait pas.
++
++CREATE INDEX ix_ops_type_status_date ON operations (type, status, created_at);
+diff --git a/src/main/db/migrate.ts b/src/main/db/migrate.ts
+index a625016..b31a933 100644
+--- a/src/main/db/migrate.ts
++++ b/src/main/db/migrate.ts
+@@ -11,13 +11,15 @@ import lines002 from '../../../migrations/002_operation_lines.sql?raw'
+ import manual003 from '../../../migrations/003_manual_and_redo.sql?raw'
+ import freeOrder004 from '../../../migrations/004_free_weighing_order.sql?raw'
+ import retour005 from '../../../migrations/005_retour.sql?raw'
++import listIndexes006 from '../../../migrations/006_ticket_list_indexes.sql?raw'
+ 
+ const MIGRATIONS: ReadonlyArray<{ version: string; sql: string }> = [
+   { version: '001_init', sql: init001 },
+   { version: '002_operation_lines', sql: lines002 },
+   { version: '003_manual_and_redo', sql: manual003 },
+   { version: '004_free_weighing_order', sql: freeOrder004 },
+-  { version: '005_retour', sql: retour005 }
++  { version: '005_retour', sql: retour005 },
++  { version: '006_ticket_list_indexes', sql: listIndexes006 }
+ ]
+ 
+ export async function migrate(cfg: DbConfig): Promise<string[]> {
+diff --git a/src/main/db/operations.integration.test.ts b/src/main/db/operations.integration.test.ts
+index 847d302..0b14df0 100644
+--- a/src/main/db/operations.integration.test.ts
++++ b/src/main/db/operations.integration.test.ts
+@@ -528,4 +528,116 @@ describe.skipIf(!enabled)('dépôt des opérations (base réelle)', () => {
+     expect(await ids(undefined, '2020-03-14')).toEqual([])
+     expect(await ids('2020-03-01', '2020-03-31')).toEqual([ticket.id])
+   })
++  describe('liste paginée', () => {
++    const make = async (plate: string, type: 'TIERS' | 'ENTREE' = 'TIERS'): Promise<number> =>
++      (await operations.create({ type, plate }, user)).id
++
++    it('découpe en pages sans doublon ni oubli, du plus récent au plus ancien', async () => {
++      const made: number[] = []
++      for (let i = 0; i < 7; i++) made.push(await make(`PGTEST-${i}`))
++
++      const base = { type: 'TIERS' as const, search: 'PGTEST', pageSize: 3 }
++      const p1 = await operations.page({ ...base, page: 1 })
++      const p2 = await operations.page({ ...base, page: 2 })
++      const p3 = await operations.page({ ...base, page: 3 })
++
++      expect([p1.total, p1.pages, p1.pageSize]).toEqual([7, 3, 3])
++      expect([p1.rows.length, p2.rows.length, p3.rows.length]).toEqual([3, 3, 1])
++
++      const seen = [...p1.rows, ...p2.rows, ...p3.rows].map((o) => o.id)
++      expect(new Set(seen).size).toBe(7) // aucun doublon
++      expect([...seen].sort((a, b) => a - b)).toEqual([...made].sort((a, b) => a - b)) // aucun oubli
++      expect(seen).toEqual([...seen].sort((a, b) => b - a)) // plus récent d'abord, même seconde
++    })
++
++    it('ramène une page trop lointaine à la dernière, et borne la taille de page', async () => {
++      const far = await operations.page({
++        type: 'TIERS',
++        search: 'PGTEST',
++        page: 99,
++        pageSize: 3
++      })
++      expect(far.page).toBe(3)
++      expect(far.rows).toHaveLength(1)
++
++      const huge = await operations.page({ type: 'TIERS', search: 'PGTEST', pageSize: 100000 })
++      expect(huge.pageSize).toBe(100)
++
++      const none = await operations.page({ type: 'TIERS', search: 'AUCUN-TICKET-NE-CORRESPOND' })
++      expect([none.total, none.pages, none.page, none.rows.length]).toEqual([0, 1, 1, 0])
++    })
++
++    it('trouve un matricule sans tenir compte de la casse, des espaces ni des tirets', async () => {
++      const id = await make('12345-116-16')
++      for (const term of ['12345 116 16', '1234511616', '12345-116-16', '116 16']) {
++        const found = await operations.page({ type: 'TIERS', search: term })
++        expect(found.rows.map((o) => o.id)).toContain(id)
++      }
++      const lower = await make('ab-123-cd')
++      const found = await operations.page({ type: 'TIERS', search: 'AB123CD' })
++      expect(found.rows.map((o) => o.id)).toContain(lower)
++    })
++
++    it('cherche « % » et « _ » tels quels, sans les traiter comme des jokers', async () => {
++      const literal = await make('WILD%CARD')
++      const other = await make('WILDXCARD')
++      const found = await operations.page({ type: 'TIERS', search: 'WILD%CARD' })
++      expect(found.rows.map((o) => o.id)).toEqual([literal])
++      expect(found.rows.map((o) => o.id)).not.toContain(other)
++
++      const underscore = await operations.page({ type: 'TIERS', search: 'WILD_CARD' })
++      expect(underscore.rows).toHaveLength(0)
++    })
++
++    it('« en attente de la 2e pesée » : pesé une fois seulement', async () => {
++      const waiting = await make('PGWAIT-1', 'ENTREE')
++      const fresh = await make('PGWAIT-2', 'ENTREE') // aucune pesée
++      const done = await make('PGWAIT-3', 'ENTREE')
++
++      await operations.capture({ operationId: waiting, weight: 9000, isManual: false }, user, 'p')
++      await operations.capture({ operationId: done, weight: 9000, isManual: false }, user, 'p')
++      await operations.capture(
++        {
++          operationId: done,
++          weight: 4000,
++          isManual: false,
++          lines: [{ productCode: 'CIMENT', quantityKg: 5000 }]
++        },
++        user,
++        'p'
++      )
++
++      const list = await operations.page({
++        type: 'ENTREE',
++        status: 'OUVERTE',
++        awaitingSecond: true,
++        search: 'PGWAIT'
++      })
++      expect(list.rows.map((o) => o.id)).toEqual([waiting])
++      expect(list.total).toBe(1)
++      expect(list.rows.map((o) => o.id)).not.toContain(fresh)
++      expect(list.rows.map((o) => o.id)).not.toContain(done)
++    })
++
++    it('combine recherche, période et page sur le même total', async () => {
++      const id = await make('PGDATE-1')
++      await pool
++        .getPool()
++        .query("UPDATE operations SET created_at = '2019-06-15 23:59:59' WHERE id = ?", [id])
++
++      const inRange = await operations.page({
++        type: 'TIERS',
++        search: 'PGDATE',
++        dateFrom: '2019-06-15',
++        dateTo: '2019-06-15'
++      })
++      expect(inRange.total).toBe(1)
++      const outside = await operations.page({
++        type: 'TIERS',
++        search: 'PGDATE',
++        dateFrom: '2019-06-16'
++      })
++      expect(outside.total).toBe(0)
++    })
++  })
+ })
+diff --git a/src/main/db/operations.ts b/src/main/db/operations.ts
+index 7a9ec4f..4180037 100644
+--- a/src/main/db/operations.ts
++++ b/src/main/db/operations.ts
+@@ -9,8 +9,17 @@
+  *  - une tare supérieure au brut est refusée (cf. computeTicket).
+  */
+ import type { PoolConnection, ResultSetHeader, RowDataPacket } from 'mysql2/promise'
+-import type { CaptureInput, Location, OpFilter, OpUpdate } from '@shared/channels'
++import type {
++  CaptureInput,
++  Location,
++  OpFilter,
++  OpPage,
++  OpPageFilter,
++  OpUpdate
++} from '@shared/channels'
+ import { CENTRAL_LOCATION_CODE, resolveLocations } from '@shared/domain/locations'
++import { pageWindow } from '@shared/domain/paging'
++import { containsPattern, searchKey } from '@shared/domain/search'
+ import { computeTicket, counterScope, formatTicketNo } from '@shared/domain/weighing'
+ import type {
+   Operation,
+@@ -537,7 +546,18 @@ export async function setSetting(key: string, value: string): Promise<void> {
+   )
+ }
+ 
+-export async function list(filter: OpFilter): Promise<Operation[]> {
++/** Colonne comparée sans casse, espaces ni tirets (« 12345-116-16 » = « 1234511616 »). */
++const stripped = (column: string): string =>
++  `REPLACE(REPLACE(REPLACE(REPLACE(UPPER(${column}),'-',''),' ',''),'.',''),'/','')`
++
++/**
++ * Clause WHERE commune à `list` et `page`. Tout vient de paramètres liés ; les
++ * colonnes sont écrites ici, jamais prises du renderer.
++ *
++ * L'ordre des conditions suit l'index `ix_ops_type_status_date` (type, statut,
++ * date) : type et statut en égalité, la date en intervalle.
++ */
++function buildWhere(filter: OpFilter): { sql: string; params: unknown[] } {
+   const where: string[] = []
+   const params: unknown[] = []
+ 
+@@ -558,29 +578,101 @@ export async function list(filter: OpFilter): Promise<Operation[]> {
+     where.push('o.created_at < DATE_ADD(?, INTERVAL 1 DAY)')
+     params.push(filter.dateTo)
+   }
++  if (filter.awaitingSecond) {
++    where.push('o.first_weight IS NOT NULL AND o.second_weight IS NULL')
++  }
+   if (filter.search) {
+-    where.push(
+-      `(o.ticket_no LIKE ? OR o.plate LIKE ? OR o.bl_no LIKE ? OR o.partner_name LIKE ?
+-        OR o.driver_name LIKE ?
+-        OR EXISTS (SELECT 1 FROM operation_lines l
+-                    WHERE l.operation_id = o.id AND l.product_code LIKE ?))`
+-    )
+-    const like = `%${filter.search}%`
++    // Le texte est cherché tel quel (jokers échappés) ET sous sa forme tolérante
++    // pour le numéro de ticket, le matricule et le chauffeur.
++    const like = containsPattern(filter.search)
++    const clauses = [
++      'o.ticket_no LIKE ?',
++      'o.plate LIKE ?',
++      'o.bl_no LIKE ?',
++      'o.partner_name LIKE ?',
++      'o.driver_name LIKE ?',
++      `EXISTS (SELECT 1 FROM operation_lines l
++                WHERE l.operation_id = o.id AND l.product_code LIKE ?)`
++    ]
+     params.push(like, like, like, like, like, like)
++    const key = searchKey(filter.search)
++    if (key !== '') {
++      const keyLike = containsPattern(key)
++      for (const column of ['o.ticket_no', 'o.plate', 'o.driver_name']) {
++        clauses.push(`${stripped(column)} LIKE ?`)
++        params.push(keyLike)
++      }
++    }
++    where.push(`(${clauses.join(' OR ')})`)
+   }
+ 
+-  // `limit` est un entier borné par opFilterSchema : interpolé, jamais concaténé brut.
+-  const limit = Math.min(Math.max(filter.limit ?? 100, 1), 500)
+-  const [rows] = await getPool().query<RowDataPacket[]>(
+-    `SELECT o.*, u.full_name AS operator_name
++  return { sql: where.length ? `WHERE ${where.join(' AND ')}` : '', params }
++}
++
++/**
++ * « Jointure différée » : la page (tri + LIMIT) se choisit sur `operations` seule,
++ * grâce à l'index, puis on ne joint `users` que pour ces quelques lignes.
++ *
++ * Écrite avec la jointure directe, la requête était lente : `users` ne compte que
++ * quelques lignes, l'optimiseur la lisait en premier puis parcourait presque toute
++ * la table des tickets et la triait à chaque page (≈ 560 ms pour 300 000 tickets,
++ * contre ≈ 2 ms ici). Même résultat, même tri.
++ */
++const withOperator = (
++  where: string,
++  order: string
++): string => `SELECT o.*, u.full_name AS operator_name
+        FROM operations o
++       JOIN (SELECT o.id FROM operations o ${where} ORDER BY ${order} LIMIT ? OFFSET ?) pg
++         ON pg.id = o.id
+        JOIN users u ON u.id = o.operator_id
+-       ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+-      ORDER BY o.id DESC
+-      LIMIT ${limit}`,
++      ORDER BY ${order}`
++
++export async function list(filter: OpFilter): Promise<Operation[]> {
++  const { sql, params } = buildWhere(filter)
++  // `limit` est un entier borné par opFilterSchema.
++  const limit = Math.min(Math.max(filter.limit ?? 100, 1), 500)
++  const [rows] = await getPool().query<RowDataPacket[]>(withOperator(sql, 'o.id DESC'), [
++    ...params,
++    limit,
++    0
++  ])
++  return attachLines(rows.map(toOperation))
++}
++
++/**
++ * Une page de tickets, du plus récent au plus ancien.
++ *
++ *  - Le tri `created_at DESC, id DESC` est total (l'id départage les égalités) :
++ *    deux pages ne se chevauchent pas et n'oublient aucun ticket.
++ *  - Le COUNT ne joint rien et ne lit que l'index quand la recherche est vide ;
++ *    la page ne lit que ses lignes, et leurs produits en une seule requête.
++ *  - Taille de page bornée (voir `pageWindow`) : le renderer ne peut pas demander
++ *    toute la table d'un coup.
++ */
++export async function page(filter: OpPageFilter): Promise<OpPage> {
++  const { sql, params } = buildWhere(filter)
++  const pool = getPool()
++
++  const [counted] = await pool.query<RowDataPacket[]>(
++    `SELECT COUNT(*) AS n FROM operations o ${sql}`,
+     params
+   )
+-  return attachLines(rows.map(toOperation))
++  const total = Number(counted[0]?.n ?? 0)
++  const window = pageWindow(total, filter.page, filter.pageSize)
++
++  const [rows] = await pool.query<RowDataPacket[]>(
++    withOperator(sql, 'o.created_at DESC, o.id DESC'),
++    [...params, window.pageSize, window.offset]
++  )
++
++  return {
++    rows: await attachLines(rows.map(toOperation)),
++    total,
++    page: window.page,
++    pageSize: window.pageSize,
++    pages: window.pages
++  }
+ }
+ 
+ export async function getById(id: number): Promise<Operation | null> {
+diff --git a/src/main/ipc.ts b/src/main/ipc.ts
+index fce5d83..e81bed4 100644
+--- a/src/main/ipc.ts
++++ b/src/main/ipc.ts
+@@ -19,6 +19,7 @@ import {
+   opCloseSchema,
+   opFilterSchema,
+   opLinesSchema,
++  opPageSchema,
+   opUpdateSchema,
+   simWeightSchema,
+   ticketDraftSchema
+@@ -170,6 +171,11 @@ export function registerIpc(): void {
+     return operations.list(parse(opFilterSchema, raw))
+   })
+ 
++  ipcMain.handle(CH.opsPage, async (_e, raw) => {
++    requireUser()
++    return operations.page(parse(opPageSchema, raw))
++  })
++
+   ipcMain.handle(CH.opsCancel, async (_e, raw) => {
+     const user = requireUser()
+     const { id, reason } = parse(cancelSchema, raw)
+diff --git a/src/preload/index.ts b/src/preload/index.ts
+index 2a2ae6a..82b152c 100644
+--- a/src/preload/index.ts
++++ b/src/preload/index.ts
+@@ -43,6 +43,7 @@ const api: AppApi = {
+     capture: (input) => invoke(CH.opsCapture, input),
+     redoFirst: (input) => invoke(CH.opsRedoFirst, input),
+     list: (filter) => invoke(CH.opsList, filter),
++    page: (filter) => invoke(CH.opsPage, filter),
+     cancel: (id, reason) => invoke(CH.opsCancel, { id, reason }),
+     close: (id) => invoke(CH.opsClose, { id }),
+     update: (id, patch) => invoke(CH.opsUpdate, { id, patch }),
+diff --git a/src/renderer/src/components/DateRangeFilter.tsx b/src/renderer/src/components/DateRangeFilter.tsx
+index ea584e4..5f5e733 100644
+--- a/src/renderer/src/components/DateRangeFilter.tsx
++++ b/src/renderer/src/components/DateRangeFilter.tsx
+@@ -17,7 +17,7 @@ export default function DateRangeFilter({
+ }) {
+   const { t } = useI18n()
+   return (
+-    <>
++    <div className="date-range">
+       <label className="inline">
+         {t('filter.from')}
+         <input
+@@ -48,6 +48,6 @@ export default function DateRangeFilter({
+           {t('filter.clearDates')}
+         </button>
+       )}
+-    </>
++    </div>
+   )
+ }
+diff --git a/src/renderer/src/components/Pagination.tsx b/src/renderer/src/components/Pagination.tsx
+new file mode 100644
+index 0000000..c830d63
+--- /dev/null
++++ b/src/renderer/src/components/Pagination.tsx
+@@ -0,0 +1,75 @@
++import { PAGE_SIZES, pageItems } from '@shared/domain/paging'
++import { useI18n } from '../i18n'
++
++/**
++ * Barre de pagination : « 26–50 sur 130 », précédent / numéros / suivant, taille de
++ * page. Rien n'est affiché pour une liste vide ; une seule page garde le total.
++ */
++export default function Pagination({
++  page,
++  pages,
++  total,
++  pageSize,
++  loading = false,
++  onPage,
++  onPageSize
++}: {
++  page: number
++  pages: number
++  total: number
++  pageSize: number
++  loading?: boolean
++  onPage: (page: number) => void
++  onPageSize: (size: number) => void
++}) {
++  const { t } = useI18n()
++  if (total === 0) return null
++
++  const from = (page - 1) * pageSize + 1
++  const to = Math.min(page * pageSize, total)
++
++  return (
++    <nav className={`pagination${loading ? ' loading' : ''}`} aria-label={t('page.label')}>
++      <span className="muted">{t('page.range', { from, to, total })}</span>
++
++      {pages > 1 && (
++        <div className="pages">
++          <button type="button" disabled={page <= 1} onClick={() => onPage(page - 1)}>
++            {t('page.prev')}
++          </button>
++          {pageItems(page, pages).map((item, index) =>
++            item == null ? (
++              <span key={`gap-${index}`} className="gap" aria-hidden="true">
++                …
++              </span>
++            ) : (
++              <button
++                key={item}
++                type="button"
++                className={item === page ? 'primary' : undefined}
++                aria-current={item === page ? 'page' : undefined}
++                onClick={() => onPage(item)}
++              >
++                {item}
++              </button>
++            )
++          )}
++          <button type="button" disabled={page >= pages} onClick={() => onPage(page + 1)}>
++            {t('page.next')}
++          </button>
++        </div>
++      )}
++
++      <label className="inline">
++        {t('page.size')}
++        <select value={pageSize} onChange={(e) => onPageSize(Number(e.target.value))}>
++          {PAGE_SIZES.map((size) => (
++            <option key={size} value={size}>
++              {size}
++            </option>
++          ))}
++        </select>
++      </label>
++    </nav>
++  )
++}
+diff --git a/src/renderer/src/components/TicketFilters.tsx b/src/renderer/src/components/TicketFilters.tsx
+new file mode 100644
+index 0000000..cbef048
+--- /dev/null
++++ b/src/renderer/src/components/TicketFilters.tsx
+@@ -0,0 +1,44 @@
++import type { ReactNode } from 'react'
++import DateRangeFilter from './DateRangeFilter'
++
++/**
++ * Barre de filtres des listes de tickets : la recherche à gauche, la période à
++ * droite, sur une même ligne. Les filtres propres à un écran (statut…) passent
++ * en `children` et se placent après la période.
++ */
++export default function TicketFilters({
++  search,
++  onSearch,
++  placeholder,
++  dateFrom,
++  dateTo,
++  onDateFrom,
++  onDateTo,
++  autoFocus = false,
++  children
++}: {
++  search: string
++  onSearch: (value: string) => void
++  placeholder: string
++  dateFrom: string
++  dateTo: string
++  onDateFrom: (value: string) => void
++  onDateTo: (value: string) => void
++  autoFocus?: boolean
++  children?: ReactNode
++}) {
++  return (
++    <div className="filter-bar">
++      <input
++        className="search-input"
++        type="search"
++        autoFocus={autoFocus}
++        placeholder={placeholder}
++        value={search}
++        onChange={(e) => onSearch(e.target.value)}
++      />
++      <DateRangeFilter from={dateFrom} to={dateTo} onFrom={onDateFrom} onTo={onDateTo} />
++      {children}
++    </div>
++  )
++}
+diff --git a/src/renderer/src/hooks/useTicketPage.ts b/src/renderer/src/hooks/useTicketPage.ts
+new file mode 100644
+index 0000000..874d0ac
+--- /dev/null
++++ b/src/renderer/src/hooks/useTicketPage.ts
+@@ -0,0 +1,110 @@
++import { useCallback, useEffect, useRef, useState } from 'react'
++import type { OpPage } from '@shared/channels'
++import { DEFAULT_PAGE_SIZE } from '@shared/domain/paging'
++import type { OperationStatus, OperationType } from '@shared/types'
++import { api, call, errorMessage } from '../api'
++
++/** Délai de frappe avant de lancer la recherche : une requête par pause, pas par touche. */
++const SEARCH_DEBOUNCE_MS = 300
++
++/**
++ * Liste paginée de tickets : filtres, page courante et requête serveur.
++ *
++ * - Le serveur ne renvoie que la page demandée (`ops.page`) : l'écran ne charge
++ *   jamais la table entière.
++ * - Tout changement de filtre ramène à la page 1, sans requête intermédiaire : la
++ *   page est rattachée à la combinaison de filtres pour laquelle elle a été choisie.
++ * - Une réponse arrivée en retard (frappe rapide) est ignorée.
++ * - L'ancienne page reste affichée pendant le chargement : pas de tableau qui clignote.
++ */
++export function useTicketPage(base: {
++  type: OperationType
++  status?: OperationStatus | null
++  /** Liste de la 2e balance : tickets pesés une fois, en attente de la 2e pesée. */
++  awaitingSecond?: boolean
++}) {
++  const { type, status = null, awaitingSecond = false } = base
++
++  const [search, setSearch] = useState('')
++  const [debounced, setDebounced] = useState('')
++  const [dateFrom, setDateFrom] = useState('')
++  const [dateTo, setDateTo] = useState('')
++  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
++
++  useEffect(() => {
++    const timer = setTimeout(() => setDebounced(search.trim()), SEARCH_DEBOUNCE_MS)
++    return () => clearTimeout(timer)
++  }, [search])
++
++  const filterKey = JSON.stringify([
++    type,
++    status,
++    awaitingSecond,
++    debounced,
++    dateFrom,
++    dateTo,
++    pageSize
++  ])
++  const [pageState, setPageState] = useState({ key: filterKey, page: 1 })
++  const page = pageState.key === filterKey ? pageState.page : 1
++  const setPage = useCallback(
++    (next: number) => setPageState({ key: filterKey, page: next }),
++    [filterKey]
++  )
++
++  const [data, setData] = useState<OpPage | null>(null)
++  const [loading, setLoading] = useState(false)
++  const [error, setError] = useState<string | null>(null)
++  const latest = useRef(0)
++
++  const load = useCallback(async (): Promise<void> => {
++    const mine = ++latest.current
++    setLoading(true)
++    try {
++      const result = await call(
++        api.ops.page({
++          type,
++          status,
++          awaitingSecond,
++          search: debounced || null,
++          dateFrom: dateFrom || null,
++          dateTo: dateTo || null,
++          page,
++          pageSize
++        })
++      )
++      if (mine !== latest.current) return
++      setData(result)
++      setError(null)
++      // La liste a rétréci : le serveur a servi la dernière page, on s'y aligne.
++      if (result.page !== page) setPage(result.page)
++    } catch (err) {
++      if (mine === latest.current) setError(errorMessage(err))
++    } finally {
++      if (mine === latest.current) setLoading(false)
++    }
++  }, [type, status, awaitingSecond, debounced, dateFrom, dateTo, page, pageSize, setPage])
++
++  useEffect(() => {
++    void load()
++  }, [load])
++
++  return {
++    data,
++    loading,
++    error,
++    reload: load,
++    search,
++    setSearch,
++    dateFrom,
++    setDateFrom,
++    dateTo,
++    setDateTo,
++    page,
++    setPage,
++    pageSize,
++    setPageSize,
++    /** Au moins un filtre est actif (sert à dire « aucun résultat » plutôt que « rien »). */
++    filtered: debounced !== '' || dateFrom !== '' || dateTo !== ''
++  }
++}
+diff --git a/src/renderer/src/i18n.tsx b/src/renderer/src/i18n.tsx
+index b9ba539..4b4aef4 100644
+--- a/src/renderer/src/i18n.tsx
++++ b/src/renderer/src/i18n.tsx
+@@ -29,6 +29,11 @@ const fr = {
+   'filter.from': 'Du',
+   'filter.to': 'Au',
+   'filter.clearDates': 'Toutes les dates',
++  'page.label': 'Pagination',
++  'page.range': '{from}–{to} sur {total}',
++  'page.prev': 'Précédent',
++  'page.next': 'Suivant',
++  'page.size': 'Par page',
+   'common.detected': 'Ports détectés',
+   'common.optional': 'facultatif',
+   'common.required': 'champ obligatoire',
+@@ -230,6 +235,11 @@ const ar: Record<TKey, string> = {
+   'filter.from': 'من',
+   'filter.to': 'إلى',
+   'filter.clearDates': 'كل التواريخ',
++  'page.label': 'التنقل بين الصفحات',
++  'page.range': '{from}–{to} من {total}',
++  'page.prev': 'السابق',
++  'page.next': 'التالي',
++  'page.size': 'لكل صفحة',
+   'common.detected': 'المنافذ المكتشفة',
+   'common.optional': 'اختياري',
+   'common.required': 'حقل إلزامي',
+diff --git a/src/renderer/src/pages/Balance2.tsx b/src/renderer/src/pages/Balance2.tsx
+index 45c4453..efa1195 100644
+--- a/src/renderer/src/pages/Balance2.tsx
++++ b/src/renderer/src/pages/Balance2.tsx
+@@ -1,20 +1,21 @@
+ import { useCallback, useEffect, useRef, useState } from 'react'
+ import type { Location, OpUpdate } from '@shared/channels'
+ import { asksFrom, asksTo, locationFieldsFor } from '@shared/domain/locations'
+-import { ticketMatchesQuery } from '@shared/domain/plate'
+ import { isManualKind } from '@shared/domain/weighing'
+ import type { Operation, OperationType, ProductLine, WeightSample } from '@shared/types'
+ import { api, call, errorMessage, formatDateTime, formatKg } from '../api'
+ import CaptureBox, { type CaptureRequest } from '../components/CaptureBox'
+-import DateRangeFilter from '../components/DateRangeFilter'
+ import LocationPickers from '../components/LocationPickers'
+ import ManualMark from '../components/ManualMark'
++import Pagination from '../components/Pagination'
+ import ProductLines, { cleanLines, hasIncompleteLine } from '../components/ProductLines'
+ import RetourToggle from '../components/RetourToggle'
+ import SimulatorPanel from '../components/SimulatorPanel'
++import TicketFilters from '../components/TicketFilters'
+ import TicketPreview from '../components/TicketPreview'
+ import WeightReadout from '../components/WeightReadout'
+ import { useBalance } from '../hooks/useBalance'
++import { useTicketPage } from '../hooks/useTicketPage'
+ import { useI18n } from '../i18n'
+ 
+ interface CompleteForm {
+@@ -67,11 +68,7 @@ const EMPTY_FORM: CompleteForm = {
+  */
+ export default function Balance2({ type }: { type: OperationType }) {
+   const { t, lang } = useI18n()
+-  const [pending, setPending] = useState<Operation[]>([])
+   const [selected, setSelected] = useState<Operation | null>(null)
+-  const [query, setQuery] = useState('')
+-  const [dateFrom, setDateFrom] = useState('')
+-  const [dateTo, setDateTo] = useState('')
+   const [form, setForm] = useState<CompleteForm>(EMPTY_FORM)
+   const [lines, setLines] = useState<ProductLine[]>([])
+   const [locations, setLocations] = useState<Location[]>([])
+@@ -84,31 +81,15 @@ export default function Balance2({ type }: { type: OperationType }) {
+ 
+   const ticketRef = useRef<Operation | null>(null)
+ 
+-  const loadPending = useCallback(async (): Promise<void> => {
+-    try {
+-      const rows = await call(
+-        api.ops.list({
+-          type,
+-          status: 'OUVERTE',
+-          limit: 200,
+-          dateFrom: dateFrom || null,
+-          dateTo: dateTo || null
+-        })
+-      )
+-      setPending(rows.filter((r) => r.first != null && r.second == null))
+-      setError(null)
+-    } catch (err) {
+-      setError(errorMessage(err))
+-    }
+-  }, [type, dateFrom, dateTo])
++  // Liste paginée côté serveur : tickets pesés une fois, en attente de la 2e pesée.
++  const list = useTicketPage({ type, status: 'OUVERTE', awaitingSecond: true })
+ 
+   useEffect(() => {
+-    void loadPending()
+     api.ref
+       .locations()
+       .then(setLocations)
+       .catch(() => undefined)
+-  }, [loadPending])
++  }, [])
+ 
+   const captureSecond = useCallback(
+     async (weight: number, manual: boolean, source: WeightSample | null): Promise<void> => {
+@@ -221,12 +202,12 @@ export default function Balance2({ type }: { type: OperationType }) {
+ 
+   function back(): void {
+     stopRedo()
+-    setQuery('')
++    list.setSearch('')
+     ticketRef.current = null
+     setSelected(null)
+     setLines([])
+     setForm(EMPTY_FORM)
+-    void loadPending()
++    void list.reload()
+   }
+ 
+   /** La 2e pesée faite ne suffit pas : c'est cette confirmation qui enregistre. */
+@@ -240,7 +221,7 @@ export default function Balance2({ type }: { type: OperationType }) {
+       ticketRef.current = closed
+       setSelected(closed)
+       setConfirmSave(false)
+-      await loadPending()
++      await list.reload()
+     } catch (err) {
+       setError(errorMessage(err))
+     } finally {
+@@ -282,26 +263,25 @@ export default function Balance2({ type }: { type: OperationType }) {
+   const closed = selected != null && selected.status !== 'OUVERTE'
+   const incomplete = hasIncompleteLine(lines)
+ 
+-  const filtered = pending.filter((op) => ticketMatchesQuery(op, query))
++  const rows = list.data?.rows ?? []
+ 
+   return (
+     <div className="station">
+-      {error && <p className="error">{error}</p>}
++      {(error ?? list.error) && <p className="error">{error ?? list.error}</p>}
+ 
+       {!selected && (
+         <div className="card form-card">
+           <h2>{t('bal2.pending')}</h2>
+-          <input
+-            className="search-input"
++          <TicketFilters
+             autoFocus
+-            type="search"
++            search={list.search}
++            onSearch={list.setSearch}
+             placeholder={t('bal2.search')}
+-            value={query}
+-            onChange={(e) => setQuery(e.target.value)}
++            dateFrom={list.dateFrom}
++            dateTo={list.dateTo}
++            onDateFrom={list.setDateFrom}
++            onDateTo={list.setDateTo}
+           />
+-          <div className="row">
+-            <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
+-          </div>
+ 
+           <table>
+             <thead>
+@@ -315,7 +295,7 @@ export default function Balance2({ type }: { type: OperationType }) {
+               </tr>
+             </thead>
+             <tbody>
+-              {filtered.map((op) => (
++              {rows.map((op) => (
+                 <tr key={op.id}>
+                   <td>
+                     <strong>{op.ticketNo}</strong>
+@@ -335,15 +315,27 @@ export default function Balance2({ type }: { type: OperationType }) {
+                   </td>
+                 </tr>
+               ))}
+-              {filtered.length === 0 && (
++              {rows.length === 0 && !list.loading && (
+                 <tr>
+                   <td colSpan={6} className="muted">
+-                    {pending.length === 0 ? t('bal2.none') : t('bal2.noMatch')}
++                    {list.filtered ? t('bal2.noMatch') : t('bal2.none')}
+                   </td>
+                 </tr>
+               )}
+             </tbody>
+           </table>
++
++          {list.data && (
++            <Pagination
++              page={list.data.page}
++              pages={list.data.pages}
++              total={list.data.total}
++              pageSize={list.data.pageSize}
++              loading={list.loading}
++              onPage={list.setPage}
++              onPageSize={list.setPageSize}
++            />
++          )}
+         </div>
+       )}
+ 
+diff --git a/src/renderer/src/pages/Operations.tsx b/src/renderer/src/pages/Operations.tsx
+index 09849a2..6c04a84 100644
+--- a/src/renderer/src/pages/Operations.tsx
++++ b/src/renderer/src/pages/Operations.tsx
+@@ -1,12 +1,14 @@
+-import { useCallback, useEffect, useState } from 'react'
++import { useEffect, useState } from 'react'
+ import type { Location, OpUpdate } from '@shared/channels'
+ import { asksFrom, asksTo, locationFieldsFor } from '@shared/domain/locations'
+ import type { Operation, OperationStatus, OperationType } from '@shared/types'
+ import { api, call, errorMessage, formatDateTime, formatKg } from '../api'
+-import DateRangeFilter from '../components/DateRangeFilter'
+ import LocationPickers from '../components/LocationPickers'
++import Pagination from '../components/Pagination'
+ import RetourToggle from '../components/RetourToggle'
++import TicketFilters from '../components/TicketFilters'
+ import TicketPreview from '../components/TicketPreview'
++import { useTicketPage } from '../hooks/useTicketPage'
+ import { useI18n } from '../i18n'
+ 
+ interface EditDraft {
+@@ -45,10 +47,6 @@ function toDraft(op: Operation): EditDraft {
+ export default function Operations({ type }: { type: OperationType }) {
+   const { t, lang } = useI18n()
+   const [status, setStatus] = useState<OperationStatus | null>(null)
+-  const [search, setSearch] = useState('')
+-  const [dateFrom, setDateFrom] = useState('')
+-  const [dateTo, setDateTo] = useState('')
+-  const [rows, setRows] = useState<Operation[]>([])
+   const [locations, setLocations] = useState<Location[]>([])
+   const [error, setError] = useState<string | null>(null)
+   const [busy, setBusy] = useState(false)
+@@ -58,29 +56,10 @@ export default function Operations({ type }: { type: OperationType }) {
+   const [draft, setDraft] = useState<EditDraft | null>(null)
+   const [preview, setPreview] = useState<{ id: number; html: string } | null>(null)
+ 
+-  const reload = useCallback(async (): Promise<void> => {
+-    try {
+-      setRows(
+-        await call(
+-          api.ops.list({
+-            type,
+-            status,
+-            search: search.trim() === '' ? null : search.trim(),
+-            dateFrom: dateFrom || null,
+-            dateTo: dateTo || null,
+-            limit: 200
+-          })
+-        )
+-      )
+-      setError(null)
+-    } catch (err) {
+-      setError(errorMessage(err))
+-    }
+-  }, [type, status, search, dateFrom, dateTo])
+-
+-  useEffect(() => {
+-    void reload()
+-  }, [reload])
++  // Liste paginée côté serveur : seule la page affichée est chargée.
++  const list = useTicketPage({ type, status })
++  const reload = list.reload
++  const rows = list.data?.rows ?? []
+ 
+   useEffect(() => {
+     api.ref
+@@ -177,7 +156,15 @@ export default function Operations({ type }: { type: OperationType }) {
+     <div className="card">
+       <h2>{`${t('ops.title')} — ${t(`station.type.${type}`)}`}</h2>
+ 
+-      <div className="row">
++      <TicketFilters
++        search={list.search}
++        onSearch={list.setSearch}
++        placeholder={t('common.search')}
++        dateFrom={list.dateFrom}
++        dateTo={list.dateTo}
++        onDateFrom={list.setDateFrom}
++        onDateTo={list.setDateTo}
++      >
+         <select
+           value={status ?? ''}
+           onChange={(e) => setStatus((e.target.value || null) as OperationStatus | null)}
+@@ -187,18 +174,12 @@ export default function Operations({ type }: { type: OperationType }) {
+           <option value="FERMEE">{t('ops.status.FERMEE')}</option>
+           <option value="ANNULEE">{t('ops.status.ANNULEE')}</option>
+         </select>
+-        <input
+-          placeholder={t('common.search')}
+-          value={search}
+-          onChange={(e) => setSearch(e.target.value)}
+-        />
+-        <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
+         <button type="button" className="ghost" onClick={() => void reload()}>
+           {t('common.refresh')}
+         </button>
+-      </div>
++      </TicketFilters>
+ 
+-      {error && <p className="error">{error}</p>}
++      {(error ?? list.error) && <p className="error">{error ?? list.error}</p>}
+ 
+       <table>
+         <thead>
+@@ -402,7 +383,7 @@ export default function Operations({ type }: { type: OperationType }) {
+               </tr>
+             )
+           )}
+-          {rows.length === 0 && (
++          {rows.length === 0 && !list.loading && (
+             <tr>
+               <td colSpan={9} className="muted">
+                 {t('ops.empty')}
+@@ -412,6 +393,18 @@ export default function Operations({ type }: { type: OperationType }) {
+         </tbody>
+       </table>
+ 
++      {list.data && (
++        <Pagination
++          page={list.data.page}
++          pages={list.data.pages}
++          total={list.data.total}
++          pageSize={list.data.pageSize}
++          loading={list.loading}
++          onPage={list.setPage}
++          onPageSize={list.setPageSize}
++        />
++      )}
++
+       {preview && (
+         <TicketPreview
+           html={preview.html}
+diff --git a/src/renderer/src/styles.css b/src/renderer/src/styles.css
+index d65a1bd..a94eba8 100644
+--- a/src/renderer/src/styles.css
++++ b/src/renderer/src/styles.css
+@@ -827,6 +827,60 @@ button.big {
+   border-radius: 10px;
+ }
+ 
++/* ---------- Filtres et pagination des listes ---------- */
++/* Recherche à gauche, période à droite, sur une ligne ; passe à la ligne si trop étroit. */
++.filter-bar {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: 12px;
++  margin-bottom: 14px;
++}
++
++.filter-bar .search-input {
++  flex: 1 1 320px;
++  width: auto;
++  min-width: 0;
++  margin-bottom: 0;
++}
++
++.date-range {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: 10px;
++}
++
++/* Sans cela, l'icône du calendrier est noire sur fond sombre. */
++input[type='date'] {
++  color-scheme: dark;
++}
++
++.pagination {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  justify-content: space-between;
++  gap: 12px;
++  margin-top: 14px;
++}
++
++.pagination .pages {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: 6px;
++}
++
++.pagination .gap {
++  color: var(--muted);
++  padding: 0 4px;
++}
++
++.pagination.loading {
++  opacity: 0.6;
++}
++
+ /* Un camion déjà en attente de 2e pesée se représente à la 1re balance. */
+ .stale-box {
+   display: flex;
+diff --git a/src/shared/channels.ts b/src/shared/channels.ts
+index 7e90c79..4af7109 100644
+--- a/src/shared/channels.ts
++++ b/src/shared/channels.ts
+@@ -32,6 +32,7 @@ export const CH = {
+   opsCapture: 'ops:capture',
+   opsRedoFirst: 'ops:redoFirst',
+   opsList: 'ops:list',
++  opsPage: 'ops:page',
+   opsCancel: 'ops:cancel',
+   opsClose: 'ops:close',
+   opsUpdate: 'ops:update',
+@@ -97,6 +98,24 @@ export interface OpFilter {
+   /** Jours inclus, au format `YYYY-MM-DD`, sur la date de création du ticket. */
+   dateFrom?: string | null
+   dateTo?: string | null
++  /** Tickets pesés une fois, en attente de la 2e pesée (liste de la 2e balance). */
++  awaitingSecond?: boolean
++}
++
++/** Une page de la liste : le tri est fixe (plus récent d'abord). */
++export interface OpPageFilter extends Omit<OpFilter, 'limit'> {
++  /** 1-based. Au-delà de la dernière page, la dernière est servie. */
++  page?: number
++  pageSize?: number
++}
++
++export interface OpPage {
++  rows: Operation[]
++  /** Nombre de tickets correspondant au filtre, toutes pages confondues. */
++  total: number
++  page: number
++  pageSize: number
++  pages: number
+ }
+ 
+ export interface CaptureInput {
+@@ -168,6 +187,8 @@ export interface AppApi {
+     /** Refait la 1re pesée (camion repassé sur la balance). L'ancienne reste tracée. */
+     redoFirst(input: CaptureInput): Promise<Operation>
+     list(filter: OpFilter): Promise<Operation[]>
++    /** Liste paginée côté serveur : seule la page demandée est lue et renvoyée. */
++    page(filter: OpPageFilter): Promise<OpPage>
+     cancel(id: number, reason: string): Promise<void>
+     /** Enregistre le ticket après confirmation de l'opérateur. */
+     close(id: number): Promise<Operation>
+diff --git a/src/shared/domain/paging.test.ts b/src/shared/domain/paging.test.ts
+new file mode 100644
+index 0000000..d8fab9a
+--- /dev/null
++++ b/src/shared/domain/paging.test.ts
+@@ -0,0 +1,50 @@
++import { describe, expect, it } from 'vitest'
++import { DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, pageItems, pageWindow } from './paging'
++
++describe('pageWindow', () => {
++  it('première page par défaut', () => {
++    expect(pageWindow(100)).toEqual({ page: 1, pageSize: DEFAULT_PAGE_SIZE, pages: 4, offset: 0 })
++  })
++
++  it('calcule le décalage et le nombre de pages', () => {
++    expect(pageWindow(101, 3, 50)).toEqual({ page: 3, pageSize: 50, pages: 3, offset: 100 })
++    expect(pageWindow(100, 2, 50)).toMatchObject({ pages: 2, offset: 50 })
++  })
++
++  it('une liste vide a une page, pas zéro', () => {
++    expect(pageWindow(0, 5)).toEqual({ page: 1, pageSize: DEFAULT_PAGE_SIZE, pages: 1, offset: 0 })
++  })
++
++  it('ramène une page trop loin à la dernière', () => {
++    expect(pageWindow(30, 99, 25)).toMatchObject({ page: 2, offset: 25 })
++  })
++
++  it('borne la page et la taille de page', () => {
++    expect(pageWindow(500, 0, 25).page).toBe(1)
++    expect(pageWindow(500, -3, 25).page).toBe(1)
++    expect(pageWindow(5000, 1, 100_000).pageSize).toBe(MAX_PAGE_SIZE)
++    expect(pageWindow(500, 1, 0).pageSize).toBe(1)
++  })
++})
++
++describe('pageItems', () => {
++  it('une seule page : un seul numéro', () => {
++    expect(pageItems(1, 1)).toEqual([1])
++    expect(pageItems(1, 0)).toEqual([1])
++  })
++
++  it('peu de pages : toutes affichées', () => {
++    expect(pageItems(2, 4)).toEqual([1, 2, 3, 4])
++    expect(pageItems(1, 5)).toEqual([1, 2, null, 5])
++  })
++
++  it('beaucoup de pages : première, dernière et voisinage, avec des trous', () => {
++    expect(pageItems(1, 100)).toEqual([1, 2, null, 100])
++    expect(pageItems(50, 100)).toEqual([1, null, 49, 50, 51, null, 100])
++    expect(pageItems(100, 100)).toEqual([1, null, 99, 100])
++  })
++
++  it("n'affiche pas « … » pour un trou d'une seule page", () => {
++    expect(pageItems(4, 10)).toEqual([1, 2, 3, 4, 5, null, 10])
++  })
++})
+diff --git a/src/shared/domain/paging.ts b/src/shared/domain/paging.ts
+new file mode 100644
+index 0000000..68bc524
+--- /dev/null
++++ b/src/shared/domain/paging.ts
+@@ -0,0 +1,53 @@
++/** Pagination des listes de tickets : bornes communes à l'écran et au serveur. */
++export const PAGE_SIZES = [25, 50, 100] as const
++export const DEFAULT_PAGE_SIZE = 25
++export const MAX_PAGE_SIZE = 100
++
++export interface PageWindow {
++  /** Page effectivement servie (1-based), ramenée dans [1, pages]. */
++  page: number
++  pageSize: number
++  pages: number
++  offset: number
++}
++
++/**
++ * Fenêtre d'une page. Une page demandée au-delà de la dernière (la liste a
++ * rétréci entre deux clics : tickets annulés, filtre plus strict) est ramenée à la
++ * dernière page plutôt que de renvoyer une page vide.
++ */
++export function pageWindow(
++  total: number,
++  page?: number | null,
++  pageSize?: number | null
++): PageWindow {
++  const size = Math.min(Math.max(Math.trunc(pageSize ?? DEFAULT_PAGE_SIZE), 1), MAX_PAGE_SIZE)
++  const pages = Math.max(1, Math.ceil(Math.max(total, 0) / size))
++  const current = Math.min(Math.max(Math.trunc(page ?? 1), 1), pages)
++  return { page: current, pageSize: size, pages, offset: (current - 1) * size }
++}
++
++/**
++ * Numéros de pages à afficher : toujours la première, la dernière et le voisinage
++ * de la page courante, avec « … » (null) pour les trous. 100 pages ne donnent pas
++ * 100 boutons.
++ */
++export function pageItems(page: number, pages: number, around = 1): Array<number | null> {
++  if (pages <= 1) return [1]
++  const wanted = new Set<number>([1, pages])
++  for (let p = page - around; p <= page + around; p++) {
++    if (p >= 1 && p <= pages) wanted.add(p)
++  }
++  const sorted = [...wanted].sort((a, b) => a - b)
++  const items: Array<number | null> = []
++  sorted.forEach((p, index) => {
++    const previous = sorted[index - 1]
++    if (previous !== undefined) {
++      if (p - previous === 2)
++        items.push(previous + 1) // un seul trou : autant afficher la page
++      else if (p - previous > 2) items.push(null)
++    }
++    items.push(p)
++  })
++  return items
++}
+diff --git a/src/shared/domain/search.test.ts b/src/shared/domain/search.test.ts
+new file mode 100644
+index 0000000..f6c5670
+--- /dev/null
++++ b/src/shared/domain/search.test.ts
+@@ -0,0 +1,22 @@
++import { describe, expect, it } from 'vitest'
++import { containsPattern, escapeLike, searchKey } from './search'
++
++describe('recherche', () => {
++  it('échappe les jokers SQL', () => {
++    expect(escapeLike('50%')).toBe('50\\%')
++    expect(escapeLike('a_b')).toBe('a\\_b')
++    expect(escapeLike('a\\b')).toBe('a\\\\b')
++    expect(containsPattern('100%')).toBe('%100\\%%')
++  })
++
++  it('laisse intact un texte ordinaire', () => {
++    expect(containsPattern('CMV X')).toBe('%CMV X%')
++  })
++
++  it('la clé ignore casse, espaces et tirets', () => {
++    expect(searchKey('12345-116-16')).toBe('1234511616')
++    expect(searchKey('12345 116 16')).toBe('1234511616')
++    expect(searchKey('e-2026-0001')).toBe('E20260001')
++    expect(searchKey(' - ')).toBe('')
++  })
++})
+diff --git a/src/shared/domain/search.ts b/src/shared/domain/search.ts
+new file mode 100644
+index 0000000..2ee953b
+--- /dev/null
++++ b/src/shared/domain/search.ts
+@@ -0,0 +1,19 @@
++import { normalizePlate } from './plate'
++
++/** Échappe `\`, `%` et `_` : le texte tapé est cherché tel quel, jamais comme joker SQL. */
++export function escapeLike(term: string): string {
++  return term.replace(/[\\%_]/g, '\\$&')
++}
++
++/** Motif « contient » pour un LIKE, joker échappé. */
++export function containsPattern(term: string): string {
++  return `%${escapeLike(term)}%`
++}
++
++/**
++ * Clé de recherche tolérante : « 12345-116-16 », « 12345 116 16 » et
++ * « 1234511616 » donnent la même clé (voir `normalizePlate`). Vide = rien à chercher.
++ */
++export function searchKey(term: string): string {
++  return normalizePlate(term)
++}
+diff --git a/src/shared/schemas.ts b/src/shared/schemas.ts
+index d77b9a5..296aaab 100644
+--- a/src/shared/schemas.ts
++++ b/src/shared/schemas.ts
+@@ -6,6 +6,7 @@
+  * Utilisé uniquement par le processus principal (dépend de zod).
+  */
+ import { z } from 'zod'
++import { MAX_PAGE_SIZE } from './domain/paging'
+ import { OPERATION_TYPES } from './types'
+ 
+ export const dbConfigSchema = z.object({
+@@ -89,7 +90,13 @@ export const opFilterSchema = z.object({
+   dateTo: z
+     .string()
+     .regex(/^\d{4}-\d{2}-\d{2}$/)
+-    .nullish()
++    .nullish(),
++  awaitingSecond: z.boolean().optional()
++})
++
++export const opPageSchema = opFilterSchema.omit({ limit: true }).extend({
++  page: z.number().int().min(1).max(1_000_000).optional(),
++  pageSize: z.number().int().min(1).max(MAX_PAGE_SIZE).optional()
+ })
+ 
+ export const loginSchema = z.object({
+-- 
+2.43.0
+

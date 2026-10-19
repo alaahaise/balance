@@ -9,7 +9,17 @@
  *  - une tare supérieure au brut est refusée (cf. computeTicket).
  */
 import type { PoolConnection, ResultSetHeader, RowDataPacket } from 'mysql2/promise'
-import type { CaptureInput, Location, OpFilter, OpUpdate } from '@shared/channels'
+import type {
+  CaptureInput,
+  Location,
+  OpFilter,
+  OpPage,
+  OpPageFilter,
+  OpUpdate
+} from '@shared/channels'
+import { CENTRAL_LOCATION_CODE, resolveLocations } from '@shared/domain/locations'
+import { pageWindow } from '@shared/domain/paging'
+import { containsPattern, searchKey } from '@shared/domain/search'
 import { computeTicket, counterScope, formatTicketNo } from '@shared/domain/weighing'
 import type {
   Operation,
@@ -66,6 +76,15 @@ async function ensureVehicle(conn: PoolConnection, plate?: string | null): Promi
   return rows[0] ? Number(rows[0].id) : null
 }
 
+/** Le stock central : lieu par défaut quand l'opérateur n'a pas à choisir. */
+async function centralLocationId(conn: PoolConnection): Promise<number | null> {
+  const [rows] = await conn.query<RowDataPacket[]>(
+    'SELECT id FROM locations WHERE code = ? AND active = 1',
+    [CENTRAL_LOCATION_CODE]
+  )
+  return rows[0] ? Number(rows[0].id) : null
+}
+
 /**
  * Remplace la liste des produits d'un ticket (remplacement complet, pas de
  * fusion : l'écran envoie toujours la liste entière).
@@ -94,24 +113,33 @@ export async function create(draft: TicketDraft, user: SessionUser): Promise<Ope
     await conn.beginTransaction()
     const ticketNo = await allocateTicket(conn, draft.type)
     const vehicleId = await ensureVehicle(conn, draft.plate)
+    const isRetour = draft.isRetour === true
+    const places = resolveLocations({
+      type: draft.type,
+      isRetour,
+      fromId: draft.locationFromId ?? null,
+      toId: draft.locationToId ?? null,
+      centralId: await centralLocationId(conn)
+    })
 
     const [result] = await conn.query<ResultSetHeader>(
       `INSERT INTO operations
-         (ticket_no, type, status, vehicle_id, plate, driver_name,
+         (ticket_no, type, is_retour, status, vehicle_id, plate, driver_name,
           partner_id, partner_name, location_from_id, location_to_id, bl_no, bl_date,
           notes, operator_id)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
         ticketNo,
         draft.type,
+        isRetour ? 1 : 0,
         'OUVERTE',
         vehicleId,
         draft.plate?.trim().toUpperCase() || null,
         draft.driverName?.trim() || null,
         draft.partnerId ?? null,
         draft.partnerName?.trim() || null,
-        draft.locationFromId ?? null,
-        draft.locationToId ?? null,
+        places.fromId,
+        places.toId,
         draft.blNo?.trim() || null,
         draft.blDate?.trim() || null,
         draft.notes?.trim() || null,
@@ -324,6 +352,7 @@ export async function close(id: number, user: SessionUser): Promise<Operation> {
  * table `weighings` est la trace de ce qui a été pesé.
  */
 const UPDATABLE_COLUMNS: Record<keyof OpUpdate, string> = {
+  isRetour: 'is_retour',
   plate: 'plate',
   driverName: 'driver_name',
   partnerName: 'partner_name',
@@ -341,22 +370,53 @@ export async function update(id: number, patch: OpUpdate, user: SessionUser): Pr
     if (!(key in patch)) continue
     const value = patch[key as keyof OpUpdate] ?? null
     sets.push(`${column} = ?`) // nom de colonne issu d'une table blanche, jamais du renderer
-    params.push(key === 'plate' && typeof value === 'string' ? value.toUpperCase() : value)
+    if (key === 'isRetour') params.push(value === true ? 1 : 0)
+    else params.push(key === 'plate' && typeof value === 'string' ? value.toUpperCase() : value)
   }
   if (sets.length === 0) throw new Error('Aucune modification à enregistrer')
 
-  params.push(id)
-  const pool = getPool()
-  const [result] = await pool.query<ResultSetHeader>(
-    `UPDATE operations SET ${sets.join(', ')} WHERE id = ?`,
-    params
-  )
-  if (result.affectedRows === 0) throw new Error('Ticket introuvable')
+  const conn = await getPool().getConnection()
+  try {
+    await conn.beginTransaction()
+    params.push(id)
+    const [result] = await conn.query<ResultSetHeader>(
+      `UPDATE operations SET ${sets.join(', ')} WHERE id = ?`,
+      params
+    )
+    if (result.affectedRows === 0) throw new Error('Ticket introuvable')
 
-  await pool.query(
-    `INSERT INTO audit_log (user_id, action, entity, entity_id, after_json) VALUES (?,?,?,?,?)`,
-    [user.id, 'UPDATE', 'operations', String(id), JSON.stringify(patch)]
-  )
+    // Les lieux se déduisent du type et du retour : changer l'un des deux (ou
+    // envoyer un lieu que ce type ne demande pas) ne doit pas laisser le stock
+    // pointer sur un lieu incohérent.
+    const [rows] = await conn.query<RowDataPacket[]>(
+      'SELECT type, is_retour, location_from_id, location_to_id FROM operations WHERE id = ?',
+      [id]
+    )
+    const row = rows[0]
+    if (!row) throw new Error('Ticket introuvable')
+    const places = resolveLocations({
+      type: row.type as OperationType,
+      isRetour: Boolean(Number(row.is_retour)),
+      fromId: row.location_from_id == null ? null : Number(row.location_from_id),
+      toId: row.location_to_id == null ? null : Number(row.location_to_id),
+      centralId: await centralLocationId(conn)
+    })
+    await conn.query(
+      'UPDATE operations SET location_from_id = ?, location_to_id = ? WHERE id = ?',
+      [places.fromId, places.toId, id]
+    )
+
+    await conn.query(
+      `INSERT INTO audit_log (user_id, action, entity, entity_id, after_json) VALUES (?,?,?,?,?)`,
+      [user.id, 'UPDATE', 'operations', String(id), JSON.stringify(patch)]
+    )
+    await conn.commit()
+  } catch (err) {
+    await conn.rollback().catch(() => undefined)
+    throw err
+  } finally {
+    conn.release()
+  }
 
   const updated = await getById(id)
   if (!updated) throw new Error('Ticket introuvable après modification')
@@ -486,7 +546,18 @@ export async function setSetting(key: string, value: string): Promise<void> {
   )
 }
 
-export async function list(filter: OpFilter): Promise<Operation[]> {
+/** Colonne comparée sans casse, espaces ni tirets (« 12345-116-16 » = « 1234511616 »). */
+const stripped = (column: string): string =>
+  `REPLACE(REPLACE(REPLACE(REPLACE(UPPER(${column}),'-',''),' ',''),'.',''),'/','')`
+
+/**
+ * Clause WHERE commune à `list` et `page`. Tout vient de paramètres liés ; les
+ * colonnes sont écrites ici, jamais prises du renderer.
+ *
+ * L'ordre des conditions suit l'index `ix_ops_type_status_date` (type, statut,
+ * date) : type et statut en égalité, la date en intervalle.
+ */
+function buildWhere(filter: OpFilter): { sql: string; params: unknown[] } {
   const where: string[] = []
   const params: unknown[] = []
 
@@ -498,29 +569,110 @@ export async function list(filter: OpFilter): Promise<Operation[]> {
     where.push('o.status = ?')
     params.push(filter.status)
   }
+  // Jours inclus : de 00:00 du premier jour jusqu'à la fin du dernier.
+  if (filter.dateFrom) {
+    where.push('o.created_at >= ?')
+    params.push(`${filter.dateFrom} 00:00:00`)
+  }
+  if (filter.dateTo) {
+    where.push('o.created_at < DATE_ADD(?, INTERVAL 1 DAY)')
+    params.push(filter.dateTo)
+  }
+  if (filter.awaitingSecond) {
+    where.push('o.first_weight IS NOT NULL AND o.second_weight IS NULL')
+  }
   if (filter.search) {
-    where.push(
-      `(o.ticket_no LIKE ? OR o.plate LIKE ? OR o.bl_no LIKE ? OR o.partner_name LIKE ?
-        OR o.driver_name LIKE ?
-        OR EXISTS (SELECT 1 FROM operation_lines l
-                    WHERE l.operation_id = o.id AND l.product_code LIKE ?))`
-    )
-    const like = `%${filter.search}%`
+    // Le texte est cherché tel quel (jokers échappés) ET sous sa forme tolérante
+    // pour le numéro de ticket, le matricule et le chauffeur.
+    const like = containsPattern(filter.search)
+    const clauses = [
+      'o.ticket_no LIKE ?',
+      'o.plate LIKE ?',
+      'o.bl_no LIKE ?',
+      'o.partner_name LIKE ?',
+      'o.driver_name LIKE ?',
+      `EXISTS (SELECT 1 FROM operation_lines l
+                WHERE l.operation_id = o.id AND l.product_code LIKE ?)`
+    ]
     params.push(like, like, like, like, like, like)
+    const key = searchKey(filter.search)
+    if (key !== '') {
+      const keyLike = containsPattern(key)
+      for (const column of ['o.ticket_no', 'o.plate', 'o.driver_name']) {
+        clauses.push(`${stripped(column)} LIKE ?`)
+        params.push(keyLike)
+      }
+    }
+    where.push(`(${clauses.join(' OR ')})`)
   }
 
-  // `limit` est un entier borné par opFilterSchema : interpolé, jamais concaténé brut.
-  const limit = Math.min(Math.max(filter.limit ?? 100, 1), 500)
-  const [rows] = await getPool().query<RowDataPacket[]>(
-    `SELECT o.*, u.full_name AS operator_name
+  return { sql: where.length ? `WHERE ${where.join(' AND ')}` : '', params }
+}
+
+/**
+ * « Jointure différée » : la page (tri + LIMIT) se choisit sur `operations` seule,
+ * grâce à l'index, puis on ne joint `users` que pour ces quelques lignes.
+ *
+ * Écrite avec la jointure directe, la requête était lente : `users` ne compte que
+ * quelques lignes, l'optimiseur la lisait en premier puis parcourait presque toute
+ * la table des tickets et la triait à chaque page (≈ 560 ms pour 300 000 tickets,
+ * contre ≈ 2 ms ici). Même résultat, même tri.
+ */
+const withOperator = (
+  where: string,
+  order: string
+): string => `SELECT o.*, u.full_name AS operator_name
        FROM operations o
+       JOIN (SELECT o.id FROM operations o ${where} ORDER BY ${order} LIMIT ? OFFSET ?) pg
+         ON pg.id = o.id
        JOIN users u ON u.id = o.operator_id
-       ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
-      ORDER BY o.id DESC
-      LIMIT ${limit}`,
+      ORDER BY ${order}`
+
+export async function list(filter: OpFilter): Promise<Operation[]> {
+  const { sql, params } = buildWhere(filter)
+  // `limit` est un entier borné par opFilterSchema.
+  const limit = Math.min(Math.max(filter.limit ?? 100, 1), 500)
+  const [rows] = await getPool().query<RowDataPacket[]>(withOperator(sql, 'o.id DESC'), [
+    ...params,
+    limit,
+    0
+  ])
+  return attachLines(rows.map(toOperation))
+}
+
+/**
+ * Une page de tickets, du plus récent au plus ancien.
+ *
+ *  - Le tri `created_at DESC, id DESC` est total (l'id départage les égalités) :
+ *    deux pages ne se chevauchent pas et n'oublient aucun ticket.
+ *  - Le COUNT ne joint rien et ne lit que l'index quand la recherche est vide ;
+ *    la page ne lit que ses lignes, et leurs produits en une seule requête.
+ *  - Taille de page bornée (voir `pageWindow`) : le renderer ne peut pas demander
+ *    toute la table d'un coup.
+ */
+export async function page(filter: OpPageFilter): Promise<OpPage> {
+  const { sql, params } = buildWhere(filter)
+  const pool = getPool()
+
+  const [counted] = await pool.query<RowDataPacket[]>(
+    `SELECT COUNT(*) AS n FROM operations o ${sql}`,
     params
   )
-  return attachLines(rows.map(toOperation))
+  const total = Number(counted[0]?.n ?? 0)
+  const window = pageWindow(total, filter.page, filter.pageSize)
+
+  const [rows] = await pool.query<RowDataPacket[]>(
+    withOperator(sql, 'o.created_at DESC, o.id DESC'),
+    [...params, window.pageSize, window.offset]
+  )
+
+  return {
+    rows: await attachLines(rows.map(toOperation)),
+    total,
+    page: window.page,
+    pageSize: window.pageSize,
+    pages: window.pages
+  }
 }
 
 export async function getById(id: number): Promise<Operation | null> {
@@ -591,6 +743,7 @@ function toOperation(row: RowDataPacket): Operation {
     ticketNo: String(row.ticket_no),
     type,
     status: row.status,
+    isRetour: Boolean(Number(row.is_retour ?? 0)),
     plate: row.plate ?? null,
     driverName: row.driver_name ?? null,
     partnerId: num(row.partner_id),

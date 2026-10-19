@@ -1,19 +1,25 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Location, OpUpdate } from '@shared/channels'
-import { ticketMatchesQuery } from '@shared/domain/plate'
+import { asksFrom, asksTo, locationFieldsFor } from '@shared/domain/locations'
 import { isManualKind } from '@shared/domain/weighing'
 import type { Operation, OperationType, ProductLine, WeightSample } from '@shared/types'
 import { api, call, errorMessage, formatDateTime, formatKg } from '../api'
 import CaptureBox, { type CaptureRequest } from '../components/CaptureBox'
+import LocationPickers from '../components/LocationPickers'
 import ManualMark from '../components/ManualMark'
+import Pagination from '../components/Pagination'
 import ProductLines, { cleanLines, hasIncompleteLine } from '../components/ProductLines'
+import RetourToggle from '../components/RetourToggle'
 import SimulatorPanel from '../components/SimulatorPanel'
+import TicketFilters from '../components/TicketFilters'
 import TicketPreview from '../components/TicketPreview'
 import WeightReadout from '../components/WeightReadout'
 import { useBalance } from '../hooks/useBalance'
+import { useTicketPage } from '../hooks/useTicketPage'
 import { useI18n } from '../i18n'
 
 interface CompleteForm {
+  isRetour: boolean
   partnerName: string
   blNo: string
   locationFromId: string
@@ -21,18 +27,30 @@ interface CompleteForm {
   notes: string
 }
 
-/** Champs descriptifs saisis à l'écran, au format de `ops.update`. */
-function infoPatch(form: CompleteForm): OpUpdate {
-  return {
+/**
+ * Champs descriptifs saisis à l'écran, au format de `ops.update`.
+ * Seuls les lieux que ce type de ticket demande sont envoyés : le serveur fixe
+ * les autres (une sortie part du stock central vers l'extérieur).
+ */
+function infoPatch(form: CompleteForm, type: OperationType): OpUpdate {
+  const fields = locationFieldsFor(type, form.isRetour)
+  const patch: OpUpdate = {
+    isRetour: form.isRetour,
     partnerName: form.partnerName || null,
     blNo: form.blNo || null,
-    locationFromId: form.locationFromId === '' ? null : Number(form.locationFromId),
-    locationToId: form.locationToId === '' ? null : Number(form.locationToId),
     notes: form.notes || null
   }
+  if (asksFrom(fields)) {
+    patch.locationFromId = form.locationFromId === '' ? null : Number(form.locationFromId)
+  }
+  if (asksTo(fields)) {
+    patch.locationToId = form.locationToId === '' ? null : Number(form.locationToId)
+  }
+  return patch
 }
 
 const EMPTY_FORM: CompleteForm = {
+  isRetour: false,
   partnerName: '',
   blNo: '',
   locationFromId: '',
@@ -50,9 +68,7 @@ const EMPTY_FORM: CompleteForm = {
  */
 export default function Balance2({ type }: { type: OperationType }) {
   const { t, lang } = useI18n()
-  const [pending, setPending] = useState<Operation[]>([])
   const [selected, setSelected] = useState<Operation | null>(null)
-  const [query, setQuery] = useState('')
   const [form, setForm] = useState<CompleteForm>(EMPTY_FORM)
   const [lines, setLines] = useState<ProductLine[]>([])
   const [locations, setLocations] = useState<Location[]>([])
@@ -65,23 +81,15 @@ export default function Balance2({ type }: { type: OperationType }) {
 
   const ticketRef = useRef<Operation | null>(null)
 
-  const loadPending = useCallback(async (): Promise<void> => {
-    try {
-      const rows = await call(api.ops.list({ type, status: 'OUVERTE', limit: 200 }))
-      setPending(rows.filter((r) => r.first != null && r.second == null))
-      setError(null)
-    } catch (err) {
-      setError(errorMessage(err))
-    }
-  }, [type])
+  // Liste paginée côté serveur : tickets pesés une fois, en attente de la 2e pesée.
+  const list = useTicketPage({ type, status: 'OUVERTE', awaitingSecond: true })
 
   useEffect(() => {
-    void loadPending()
     api.ref
       .locations()
       .then(setLocations)
       .catch(() => undefined)
-  }, [loadPending])
+  }, [])
 
   const captureSecond = useCallback(
     async (weight: number, manual: boolean, source: WeightSample | null): Promise<void> => {
@@ -101,7 +109,7 @@ export default function Balance2({ type }: { type: OperationType }) {
       try {
         // Les informations saisies partent avec la pesée : pas d'étape
         // « enregistrer » à oublier avant de peser.
-        await call(api.ops.update(current.id, infoPatch(form)))
+        await call(api.ops.update(current.id, infoPatch(form, type)))
         const updated = await call(
           api.ops.capture({
             operationId: current.id,
@@ -120,7 +128,7 @@ export default function Balance2({ type }: { type: OperationType }) {
         setBusy(false)
       }
     },
-    [lines, form, t]
+    [lines, form, type, t]
   )
 
   /** La 1re pesée est refaite : nouveau poids ; l'ancienne reste tracée côté base. */
@@ -177,6 +185,7 @@ export default function Balance2({ type }: { type: OperationType }) {
     ticketRef.current = op
     setSelected(op)
     setForm({
+      isRetour: op.isRetour,
       partnerName: op.partnerName ?? '',
       blNo: op.blNo ?? '',
       locationFromId: op.locationFromId == null ? '' : String(op.locationFromId),
@@ -193,12 +202,12 @@ export default function Balance2({ type }: { type: OperationType }) {
 
   function back(): void {
     stopRedo()
-    setQuery('')
+    list.setSearch('')
     ticketRef.current = null
     setSelected(null)
     setLines([])
     setForm(EMPTY_FORM)
-    void loadPending()
+    void list.reload()
   }
 
   /** La 2e pesée faite ne suffit pas : c'est cette confirmation qui enregistre. */
@@ -212,7 +221,7 @@ export default function Balance2({ type }: { type: OperationType }) {
       ticketRef.current = closed
       setSelected(closed)
       setConfirmSave(false)
-      await loadPending()
+      await list.reload()
     } catch (err) {
       setError(errorMessage(err))
     } finally {
@@ -254,33 +263,24 @@ export default function Balance2({ type }: { type: OperationType }) {
   const closed = selected != null && selected.status !== 'OUVERTE'
   const incomplete = hasIncompleteLine(lines)
 
-  const locationOptions = (
-    <>
-      <option value="">{t('station.outside')}</option>
-      {locations.map((l) => (
-        <option key={l.id} value={l.id}>
-          {lang === 'ar' && l.nameAr ? l.nameAr : l.name}
-        </option>
-      ))}
-    </>
-  )
-
-  const filtered = pending.filter((op) => ticketMatchesQuery(op, query))
+  const rows = list.data?.rows ?? []
 
   return (
     <div className="station">
-      {error && <p className="error">{error}</p>}
+      {(error ?? list.error) && <p className="error">{error ?? list.error}</p>}
 
       {!selected && (
         <div className="card form-card">
           <h2>{t('bal2.pending')}</h2>
-          <input
-            className="search-input"
+          <TicketFilters
             autoFocus
-            type="search"
+            search={list.search}
+            onSearch={list.setSearch}
             placeholder={t('bal2.search')}
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            dateFrom={list.dateFrom}
+            dateTo={list.dateTo}
+            onDateFrom={list.setDateFrom}
+            onDateTo={list.setDateTo}
           />
 
           <table>
@@ -295,10 +295,11 @@ export default function Balance2({ type }: { type: OperationType }) {
               </tr>
             </thead>
             <tbody>
-              {filtered.map((op) => (
+              {rows.map((op) => (
                 <tr key={op.id}>
                   <td>
                     <strong>{op.ticketNo}</strong>
+                    {op.isRetour && <span className="badge warn">{t('station.retour')}</span>}
                   </td>
                   <td>{formatDateTime(op.createdAt)}</td>
                   <td>{op.plate || '—'}</td>
@@ -314,15 +315,27 @@ export default function Balance2({ type }: { type: OperationType }) {
                   </td>
                 </tr>
               ))}
-              {filtered.length === 0 && (
+              {rows.length === 0 && !list.loading && (
                 <tr>
                   <td colSpan={6} className="muted">
-                    {pending.length === 0 ? t('bal2.none') : t('bal2.noMatch')}
+                    {list.filtered ? t('bal2.noMatch') : t('bal2.none')}
                   </td>
                 </tr>
               )}
             </tbody>
           </table>
+
+          {list.data && (
+            <Pagination
+              page={list.data.page}
+              pages={list.data.pages}
+              total={list.data.total}
+              pageSize={list.data.pageSize}
+              loading={list.loading}
+              onPage={list.setPage}
+              onPageSize={list.setPageSize}
+            />
+          )}
         </div>
       )}
 
@@ -340,6 +353,7 @@ export default function Balance2({ type }: { type: OperationType }) {
               <span className={`badge${closed ? ' ok' : ''}`}>
                 {closed ? t('ops.final') : t('ops.primary')}
               </span>
+              {selected.isRetour && <span className="badge warn">{t('station.retour')}</span>}
               <strong>{selected.ticketNo}</strong>
               {!complete && (
                 <div className="head-actions">
@@ -398,26 +412,22 @@ export default function Balance2({ type }: { type: OperationType }) {
                     />
                   </label>
                 </div>
-                <div className="pair">
-                  <label>
-                    {t('station.locationFrom')}
-                    <select
-                      value={form.locationFromId}
-                      onChange={(e) => setForm({ ...form, locationFromId: e.target.value })}
-                    >
-                      {locationOptions}
-                    </select>
-                  </label>
-                  <label>
-                    {t('station.locationTo')}
-                    <select
-                      value={form.locationToId}
-                      onChange={(e) => setForm({ ...form, locationToId: e.target.value })}
-                    >
-                      {locationOptions}
-                    </select>
-                  </label>
-                </div>
+                <RetourToggle
+                  type={type}
+                  checked={form.isRetour}
+                  onChange={(value) => setForm({ ...form, isRetour: value })}
+                  disabled={busy}
+                />
+                <LocationPickers
+                  type={type}
+                  isRetour={form.isRetour}
+                  locations={locations}
+                  from={form.locationFromId}
+                  to={form.locationToId}
+                  onFrom={(value) => setForm({ ...form, locationFromId: value })}
+                  onTo={(value) => setForm({ ...form, locationToId: value })}
+                  disabled={busy}
+                />
                 <label>
                   {t('station.notes')}
                   <textarea

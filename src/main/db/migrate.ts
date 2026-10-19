@@ -10,12 +10,16 @@ import init001 from '../../../migrations/001_init.sql?raw'
 import lines002 from '../../../migrations/002_operation_lines.sql?raw'
 import manual003 from '../../../migrations/003_manual_and_redo.sql?raw'
 import freeOrder004 from '../../../migrations/004_free_weighing_order.sql?raw'
+import retour005 from '../../../migrations/005_retour.sql?raw'
+import listIndexes006 from '../../../migrations/006_ticket_list_indexes.sql?raw'
 
 const MIGRATIONS: ReadonlyArray<{ version: string; sql: string }> = [
   { version: '001_init', sql: init001 },
   { version: '002_operation_lines', sql: lines002 },
   { version: '003_manual_and_redo', sql: manual003 },
-  { version: '004_free_weighing_order', sql: freeOrder004 }
+  { version: '004_free_weighing_order', sql: freeOrder004 },
+  { version: '005_retour', sql: retour005 },
+  { version: '006_ticket_list_indexes', sql: listIndexes006 }
 ]
 
 export async function migrate(cfg: DbConfig): Promise<string[]> {
